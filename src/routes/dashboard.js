@@ -70,6 +70,7 @@ notificationsRouter.get("/", async (req, res) => {
       id: row.id,
       taskId: row.task_id,
       ticketId: row.ticket_id ?? null,
+      meetingId: row.meeting_id ?? null,
       title: row.title,
       body: row.body,
       dueAt: row.task_due_at ?? null,

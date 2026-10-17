@@ -1365,6 +1365,62 @@ const migrations = {
       await knex.schema.dropTableIfExists("access_rules");
     },
   },
+
+  // Workspace meetings: Google Meet, Zoom, Microsoft Teams, and custom URL meetings with
+  // 5-minute reminder alerts, sound notifications, and attendee tracking.
+  "020_meetings": {
+    async up(knex) {
+      if (!(await knex.schema.hasTable("meetings"))) {
+        await knex.schema.createTable("meetings", table => {
+          table.increments("id").primary();
+          table.integer("tenant_id").unsigned().notNullable().references("id").inTable("tenants").onDelete("CASCADE");
+          table.integer("created_by").unsigned().nullable().references("id").inTable("users").onDelete("SET NULL");
+          table.string("title", 200).notNullable();
+          table.text("description").nullable();
+          table.string("platform", 30).notNullable().defaultTo("google_meet"); // google_meet, zoom, teams, custom
+          table.string("url", 1000).notNullable();
+          table.string("start_at", 30).notNullable(); // ISO UTC string
+          table.string("end_at", 30).nullable(); // ISO UTC string
+          table.integer("reminder_minutes").notNullable().defaultTo(5);
+          table.boolean("reminder_sent").notNullable().defaultTo(false);
+          table.boolean("is_instant").notNullable().defaultTo(false);
+          table.string("created_at", 30).notNullable();
+          table.string("updated_at", 30).notNullable();
+          table.index(["tenant_id", "start_at"]);
+          table.index(["reminder_sent", "start_at"]);
+        });
+      }
+      if (!(await knex.schema.hasTable("meeting_participants"))) {
+        await knex.schema.createTable("meeting_participants", table => {
+          table.integer("meeting_id").unsigned().notNullable().references("id").inTable("meetings").onDelete("CASCADE");
+          table.integer("user_id").unsigned().notNullable().references("id").inTable("users").onDelete("CASCADE");
+          table.string("created_at", 30).notNullable();
+          table.primary(["meeting_id", "user_id"]);
+          table.index(["user_id"]);
+        });
+      }
+      const hasMeetingCol = await knex.schema.hasColumn("notifications", "meeting_id");
+      if (!hasMeetingCol) {
+        await knex.schema.alterTable("notifications", table => {
+          table.integer("meeting_id").unsigned().nullable();
+        });
+      }
+      if (knex.client.dialect === "postgresql" || knex.client.dialect === "sqlite3") {
+        await knex.raw("CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications (user_id, created_at)");
+      }
+    },
+
+    async down(knex) {
+      if (knex.client.dialect === "postgresql" || knex.client.dialect === "sqlite3") {
+        await knex.raw("DROP INDEX IF EXISTS idx_notifications_user_created");
+      }
+      await knex.schema.dropTableIfExists("meeting_participants");
+      await knex.schema.dropTableIfExists("meetings");
+      if (await knex.schema.hasColumn("notifications", "meeting_id")) {
+        await knex.schema.alterTable("notifications", table => table.dropColumn("meeting_id"));
+      }
+    },
+  },
 };
 
 /** In-code migration source: no migration files or ESM loader quirks. */

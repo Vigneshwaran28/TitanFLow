@@ -363,6 +363,16 @@ router.post("/", async (req, res) => {
   });
 
   publishTicket(req, id, { requesterId: req.user.id, assigneeId: assignee?.id ?? null });
+  if (assignee && assignee.id !== req.user.id) {
+    publish({ users: [assignee.id] }, "ticket.assigned", {
+      ticketId: id,
+      ticketKey: ticketKey(id),
+      subject: input.subject,
+      actorId: req.user.id,
+      actorName: req.user.name,
+      priority: input.priority,
+    });
+  }
   res.status(201).json(toTicket(await findTicket(db, tenantId, id), req));
 });
 
@@ -453,6 +463,16 @@ router.patch("/:id", async (req, res) => {
 
   // The previous assignee hears about it too, so the ticket drops out of their list.
   publishTicket(req, id, { requesterId: current.requester_id, assigneeId: "assignee_id" in changes ? changes.assignee_id : current.assignee_id, also: [current.assignee_id] });
+  if ("assignee_id" in changes && changes.assignee_id && changes.assignee_id !== req.user.id && changes.assignee_id !== current.assignee_id) {
+    publish({ users: [changes.assignee_id] }, "ticket.assigned", {
+      ticketId: id,
+      ticketKey: label,
+      subject: changes.subject ?? current.subject,
+      actorId: req.user.id,
+      actorName: req.user.name,
+      priority: changes.priority ?? current.priority,
+    });
+  }
   res.json(toTicket(await findTicket(db, tenantId, id), req));
 });
 

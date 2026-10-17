@@ -35,6 +35,7 @@ import setupRouter from "./routes/setup.js";
 import neonRouter from "./routes/neon.js";
 import tasksRouter from "./routes/tasks.js";
 import tenantAuditRouter from "./routes/tenantAudit.js";
+import meetingsRouter from "./routes/meetings.js";
 import teamsRouter from "./routes/teams.js";
 import ticketsRouter from "./routes/tickets.js";
 import usersRouter from "./routes/users.js";
@@ -101,6 +102,7 @@ export function createApp() {
     gate("clinic", "clinic.schedule.view", "clinic.appointments.manage", "clinic.patients.manage", "clinic.practitioner", "clinic.records.view", "clinic.providers.manage", "clinic.vitals.record"),
     clinicRouter
   );
+  app.use("/api/meetings", requireAuth, meetingsRouter);
   app.use("/api/workspace", requireAuth, workspaceRouter);
   app.use("/api", notFound);
 
