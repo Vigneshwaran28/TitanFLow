@@ -347,7 +347,7 @@ export const settingsSchema = z
         siteTitle: z.string().trim().max(60, "Keep the title under 60 characters."),
         tagline: z.string().trim().max(120),
         accent: z.enum(ACCENTS),
-        logoIcon: z.enum(LOGO_ICONS),
+        logoIcon: z.string().trim().min(1).max(80),
         logoUrl: imageUrlSchema,
         backgroundImage: imageUrlSchema,
         backgroundDim: z.number().int().min(0).max(90),
