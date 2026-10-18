@@ -89,6 +89,10 @@ const preferencesSchema = z
     sidebarPosition: z.enum(["left", "right"]),
     sidebarMode: z.enum(["full", "compact"]),
     sidebarAlign: z.enum(["left", "center"]),
+    iconLibrary: z.enum(["lucide", "tabler", "material", "heroicons", "phosphor", "remix"]),
+    iconStyle: z.enum(["outline", "filled", "bold", "rounded"]),
+    iconStrokeWidth: z.number().min(1).max(3),
+    customIcons: z.record(z.string().max(100)).nullable(),
     avatarUrl: imageUrlSchema, // "" = none (also set from the profile form)
     // Personal CSS, applied after the workspace's (same sanitizer, smaller limit); the workspace can switch it off.
     customCss: z
