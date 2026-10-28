@@ -29,18 +29,36 @@ async function main() {
   const server = app.listen(PORT, () => console.log(`[api] listening on http://localhost:${PORT} (live updates on /ws)`));
   const realtime = attachRealtime(server);
 
-  const shutdown = async () => {
-    realtime.close();
-    stopReminderScheduler();
-    stopCelebrationScheduler();
-    stopBroadcastScheduler();
-    server.close();
-    await closeAllTenantPools();
-    await closeDb();
-    process.exit(0);
+  let isShuttingDown = false;
+  const shutdown = async (signal = "SHUTDOWN") => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`[process] ${signal} received: closing resources gracefully...`);
+    try {
+      realtime.close();
+      stopReminderScheduler();
+      stopCelebrationScheduler();
+      stopBroadcastScheduler();
+      server.close();
+      await closeAllTenantPools();
+      await closeDb();
+      console.log("[process] Graceful shutdown complete.");
+      process.exit(0);
+    } catch (err) {
+      console.error("[process] Error during shutdown:", err);
+      process.exit(1);
+    }
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("unhandledRejection", (reason, promise) => {
+    console.error("[process] Unhandled promise rejection:", reason);
+  });
+  process.on("uncaughtException", (error) => {
+    console.error("[process] Uncaught exception:", error);
+    void shutdown("UNCAUGHT_EXCEPTION");
+  });
 }
 
 main().catch(error => {

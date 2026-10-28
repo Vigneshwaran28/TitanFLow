@@ -1,5 +1,4 @@
-// Persists setup results (database choice, JWT secret) in data/config.json.
-// The file is created by the setup wizard and is git-ignored.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +6,23 @@ import { fileURLToPath } from "node:url";
 export const SERVER_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 export const DATA_DIR = path.join(SERVER_ROOT, "data");
 const CONFIG_PATH = path.join(DATA_DIR, "config.json");
+
+let runtimeSecret = null;
+
+/**
+ * Returns a cryptographically secure JWT secret.
+ * Prioritizes JWT_SECRET env var; generates an ephemeral 48-byte random secret if missing.
+ */
+function getJwtSecret() {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  if (!runtimeSecret) {
+    runtimeSecret = crypto.randomBytes(48).toString("hex");
+    if (process.env.NODE_ENV === "production") {
+      console.warn("[security] WARNING: JWT_SECRET is not configured in environment. Generated an ephemeral secret for this session.");
+    }
+  }
+  return runtimeSecret;
+}
 
 /**
  * @typedef {Object} SqliteConfig
@@ -44,7 +60,7 @@ export function readConfig() {
           connectionString: process.env.DATABASE_URL,
           ssl: true,
         },
-        jwtSecret: process.env.JWT_SECRET || "cd4d30820f25a5085f6a18947570778327c47b0f125ceb8de7df86daa52691ccb4c43827a9ec2ef20e8c25462efe9008",
+        jwtSecret: getJwtSecret(),
         configuredAt: new Date().toISOString(),
       };
     }

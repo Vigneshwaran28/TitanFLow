@@ -24,7 +24,10 @@ statsRouter.get("/", async (req, res) => {
   const now = nowIso();
   const db = getDb();
   const mine = () => db("tasks").where("user_id", req.user.id);
-  const count = async query => Number((await query.count({ n: "id" }))[0].n);
+  const count = async query => {
+    const res = await query.count({ n: "id" });
+    return Number(res[0]?.n ?? 0);
+  };
 
   const [open, dueToday, overdue, completedThisWeek, byPriorityRows, completedRecent, upcomingRows] = await Promise.all([
     count(mine().whereNot("status", "done")),
@@ -63,9 +66,10 @@ notificationsRouter.get("/", async (req, res) => {
   const items = req.tenant.features.includes("tasks")
     ? await db("notifications as n").leftJoin("tasks as t", "t.id", "n.task_id").where("n.user_id", req.user.id).orderBy("n.created_at", "desc").limit(30).select("n.*", "t.due_at as task_due_at")
     : await db("notifications as n").where("n.user_id", req.user.id).orderBy("n.created_at", "desc").limit(30).select("n.*");
-  const [{ n }] = await db("notifications").where({ user_id: req.user.id, is_read: false }).count({ n: "id" });
+  const countRes = await db("notifications").where({ user_id: req.user.id, is_read: false }).count({ n: "id" });
+  const unreadCount = Number(countRes[0]?.n ?? 0);
   res.json({
-    unreadCount: Number(n),
+    unreadCount,
     items: items.map(row => ({
       id: row.id,
       taskId: row.task_id,

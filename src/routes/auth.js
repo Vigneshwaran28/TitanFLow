@@ -233,9 +233,9 @@ async function completeLogin(res, row) {
   const maintenance = await workspaceMaintenance(db, row.tenant_maintenance);
   if (maintenance.active && !bypassesMaintenance(maintenance.active, access)) throw maintenanceError(maintenance.active);
   // Only this workspace's session is set: others this browser is signed in to stay signed in.
-  startSession(res, { userId: row.id, slug: tenant.slug, settings: tenant.settings });
+  const token = startSession(res, { userId: row.id, slug: tenant.slug, settings: tenant.settings });
   await db("users").where({ id: row.id }).update({ last_login_at: nowIso() });
-  res.json({ ...toSession(row, tenant, access), maintenance });
+  res.json({ ...toSession(row, tenant, access), token, maintenance });
 }
 
 // Signs out of the workspace the request is for (X-Workspace / ?ws=, or body.workspace); { all: true } signs out

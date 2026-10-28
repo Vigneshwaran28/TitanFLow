@@ -55,7 +55,7 @@ const router = Router();
 router.use((req, res, next) => (isStandalone() ? notFound(req, res) : next()));
 
 export const ADMIN_COOKIE = "tf_admin";
-const ADMIN_AUDIENCE = "taskflow-admin";
+export const ADMIN_AUDIENCE = "taskflow-admin";
 const SESSION_HOURS = 8;
 const EXPORT_LIMIT = 10_000;
 

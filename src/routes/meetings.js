@@ -33,11 +33,21 @@ export function platformLabel(platform) {
   }
 }
 
+const safeMeetingUrl = z
+  .string()
+  .trim()
+  .min(5, "Meeting URL is required.")
+  .max(1000, "URL is too long.")
+  .refine(
+    val => /^https?:\/\/[^\s"'()<>\\]+$/i.test(val),
+    "Meeting link must start with https:// or http:// and cannot contain spaces, quotes, or brackets."
+  );
+
 const createSchema = z.object({
   title: z.string().trim().min(1, "Meeting title is required.").max(200, "Keep title under 200 characters."),
   description: z.string().trim().max(5000, "Description is too long.").optional().nullable(),
   platform: z.enum(PLATFORMS).optional(),
-  url: z.string().trim().min(5, "Meeting URL is required.").max(1000, "URL is too long."),
+  url: safeMeetingUrl,
   startAt: z.string().datetime({ offset: true }),
   endAt: z.string().datetime({ offset: true }).optional().nullable(),
   reminderMinutes: z.coerce.number().int().min(1).max(120).default(5),
@@ -50,7 +60,7 @@ const updateSchema = z
     title: z.string().trim().min(1).max(200),
     description: z.string().trim().max(5000).nullable(),
     platform: z.enum(PLATFORMS),
-    url: z.string().trim().min(5).max(1000),
+    url: safeMeetingUrl,
     startAt: z.string().datetime({ offset: true }),
     endAt: z.string().datetime({ offset: true }).nullable(),
     reminderMinutes: z.coerce.number().int().min(1).max(120),

@@ -6,6 +6,14 @@ import express from "express";
 import { SERVER_ROOT } from "./config/store.js";
 import { requireAuth, requireFeature, requirePermission } from "./middleware/auth.js";
 import { errorHandler, notFound, requireSetup } from "./middleware/errors.js";
+import {
+  adminRateLimiter,
+  authRateLimiter,
+  globalRateLimiter,
+  publicRateLimiter,
+  setupRateLimiter,
+} from "./middleware/rateLimit.js";
+import { corsHandler, securityHeaders } from "./middleware/security.js";
 import { tenantDatabaseContext } from "./middleware/tenantDatabase.js";
 import accessRulesRouter from "./routes/accessRules.js";
 import adminRouter from "./routes/admin.js";
@@ -43,27 +51,33 @@ import workspaceRouter from "./routes/workspace.js";
 
 export function createApp() {
   const app = express();
+  app.set("trust proxy", process.env.TRUST_PROXY || "loopback");
   app.disable("x-powered-by");
+  app.use(securityHeaders);
+  app.use(corsHandler);
   // gzip JSON and CSV answers (settings-heavy responses shrink several times); ZIP downloads are already compressed.
   app.use(compression({ threshold: 1024 }));
   app.use(express.json({ limit: "100kb" }));
   app.use(cookieParser());
 
+  // Global API rate limiter
+  app.use("/api", globalRateLimiter);
+
   app.get("/api/health", (req, res) => res.json({ ok: true }));
   app.use("/api/neon", neonRouter);
-  app.use("/api/setup", setupRouter);
+  app.use("/api/setup", setupRateLimiter, setupRouter);
 
   app.use("/api", requireSetup);
   // Tenants with a database of their own: the rest of the request runs against it (middleware/tenantDatabase.js).
   app.use("/api", tenantDatabaseContext);
-  app.use("/api/public/status", publicStatusRouter); // maintenance windows, for the maintenance page
-  app.use("/api/public/workspaces", publicWorkspaceRouter); // a workspace's sign-in page branding
-  app.use("/api/public/queue", publicQueueRouter); // patients follow their clinic token
-  app.use("/api/patient", patientPortalRouter); // clinic patient portal: its own sign-in (patient number + PIN), never a staff session
-  app.use("/api/public/track", publicTrackingRouter); // no sign-in: customers follow a shipment by its tracking code
-  app.use("/api/auth", authRouter);
+  app.use("/api/public/status", publicRateLimiter, publicStatusRouter); // maintenance windows, for the maintenance page
+  app.use("/api/public/workspaces", publicRateLimiter, publicWorkspaceRouter); // a workspace's sign-in page branding
+  app.use("/api/public/queue", publicRateLimiter, publicQueueRouter); // patients follow their clinic token
+  app.use("/api/patient", publicRateLimiter, patientPortalRouter); // clinic patient portal: its own sign-in (patient number + PIN), never a staff session
+  app.use("/api/public/track", publicRateLimiter, publicTrackingRouter); // no sign-in: customers follow a shipment by its tracking code
+  app.use("/api/auth", authRateLimiter, authRouter);
   // The provider console. Its address is deliberately not "/admin" (the obvious first guess).
-  app.use("/api/bunny", adminRouter);
+  app.use("/api/bunny", adminRateLimiter, adminRouter);
   // Two gates per module: the tenant must be licensed for it (FEATURES in services/tenants.js), and the
   // person must hold at least one of its permissions (services/permissions.js). Finer checks live in each router.
   const gate = (feature, ...permissions) => [requireAuth, requireFeature(feature), requirePermission(...permissions)];

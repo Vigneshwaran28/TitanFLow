@@ -42,7 +42,11 @@ export function requestedWorkspace(req) {
  * @param {string | null} slug
  * @returns {{ token: string, cookie: string } | null}
  */
-export function sessionToken(cookies, slug) {
+export function sessionToken(cookies, slug, authHeader) {
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const bearer = authHeader.slice(7).trim();
+    if (bearer) return { token: bearer, cookie: "authorization_bearer" };
+  }
   const own = slug ? cookies?.[workspaceCookie(slug)] : null;
   if (own) return { token: own, cookie: workspaceCookie(slug) };
   // Older sessions (and pages without a workspace) use tf_session; its workspace is checked after loading the account.
@@ -72,6 +76,7 @@ export function startSession(res, { userId, slug, settings }) {
   const options = cookieOptions(hours * 60 * 60 * 1000);
   res.cookie(SESSION_COOKIE, token, options);
   res.cookie(workspaceCookie(slug), token, options);
+  return token;
 }
 
 /**
@@ -93,6 +98,7 @@ export function endAllSessions(req, res) {
 
 /** Drops one cookie whose session is no longer valid (and tf_session when it carries the same token). */
 function dropSession(req, res, cookie) {
+  if (cookie === "authorization_bearer") return;
   res.clearCookie(cookie, { path: "/" });
   if (cookie !== SESSION_COOKIE && req.cookies?.[SESSION_COOKIE] === req.cookies?.[cookie]) res.clearCookie(SESSION_COOKIE, { path: "/" });
 }
@@ -176,8 +182,8 @@ export function tenantFromRow(row) {
  * @returns {Promise<{ row: Object, payload: Object, cookie: string } | { problem: { message: string, code: string }, drop: string | null }>}
  *   drop: the cookie to clear because its session can never work again (null: keep it)
  */
-export async function loadSession(db, cookies, slug) {
-  const found = sessionToken(cookies, slug);
+export async function loadSession(db, cookies, slug, authHeader) {
+  const found = sessionToken(cookies, slug, authHeader);
   if (!found) return { problem: { message: "Please sign in.", code: "UNAUTHENTICATED" }, drop: null };
   let payload;
   try {
@@ -208,7 +214,7 @@ export async function loadSession(db, cookies, slug) {
  */
 export async function requireAuth(req, res, next) {
   const db = getDb();
-  const session = await loadSession(db, req.cookies, requestedWorkspace(req));
+  const session = await loadSession(db, req.cookies, requestedWorkspace(req), req.get("authorization"));
   if (session.problem) {
     if (session.drop) dropSession(req, res, session.drop);
     throw new HttpError(401, session.problem.message, { code: session.problem.code });
