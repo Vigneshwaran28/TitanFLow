@@ -94,6 +94,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     // The app's background picture (an image link) and how much the page colour dims it, 0-90 percent.
     backgroundImage: "",
     backgroundDim: 40,
+    backgroundTextColor: "",
     // Tenant-written CSS (sanitized on save, see customCssProblem): one block for /<slug>/login, one for the app.
     customCssEnabled: false,
     customCss: { login: "", app: "" },
@@ -351,6 +352,7 @@ export const settingsSchema = z
         logoUrl: imageUrlSchema,
         backgroundImage: imageUrlSchema,
         backgroundDim: z.number().int().min(0).max(90),
+        backgroundTextColor: z.string().max(50).optional(),
         lockAccent: z.boolean(),
         style: z.enum(STYLES),
         lockStyle: z.boolean(),

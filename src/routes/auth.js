@@ -84,6 +84,7 @@ const preferencesSchema = z
     style: z.enum(STYLES).nullable(), // null = the workspace's default style
     backgroundImage: z.union([imageUrlSchema, z.literal("none")]).nullable(), // null = the workspace's picture; "none" = no picture
     backgroundDim: z.number().int().min(0).max(90).nullable(),
+    backgroundTextColor: z.string().max(50).nullable().optional(),
     font: z.enum(["auto", "system", "inter", "jakarta", "plex"]),
     sidebar: z.enum(["auto", "light", "tinted", "dark"]),
     sidebarPosition: z.enum(["left", "right"]),
