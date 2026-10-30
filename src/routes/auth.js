@@ -23,7 +23,8 @@ import { avatarUrlOf } from "../services/avatars.js";
 import { notifyUsers } from "../services/notify.js";
 import { closeOpenResets, expireStaleLinks, hashResetToken, maskEmail, OPEN_STATUSES, TOKEN_PATTERN } from "../services/passwordResets.js";
 import { usersWithPermission } from "../services/permissions.js";
-import { findAccountIdsByEmail } from "../services/users.js";
+import { createUser, findAccountIdsByEmail } from "../services/users.js";
+import { findTenantByAccessCode, recordAccessCodeUsage } from "../services/tenantAccessCodes.js";
 import { forEachDatabase, runInTenant, runInWorkspace } from "../services/tenantDatabases.js";
 import jwt from "jsonwebtoken";
 import { disconnectUser, publish } from "../services/realtime.js";
@@ -40,6 +41,8 @@ const loginSchema = z.object({
   password: z.string().min(1, "Password is required."),
   // Signing in on a workspace's own page (/w/<slug>/login): the account must belong to that workspace.
   workspace: z.string().trim().toLowerCase().max(60).optional(),
+  // Or signing in with a tenant security code / PIN from the common table
+  code: z.string().trim().max(32).optional(),
 });
 
 const profileSchema = z.object({
@@ -174,9 +177,121 @@ const toSession = (user, tenant, access) => ({
   mustChangePassword: Boolean(user.must_change_password),
 });
 
-// Accounts are created by workspace admins; there is no self-service sign-up.
+// Accounts are created by workspace admins, or self-registered using a tenant security PIN/access code.
 router.post("/register", () => {
-  throw new HttpError(403, "Accounts are created by your workspace administrator.", { code: "REGISTRATION_DISABLED" });
+  throw new HttpError(403, "Accounts are created by your workspace administrator or joined using a workspace security PIN.", { code: "REGISTRATION_DISABLED" });
+});
+
+// ---- Tenant Access Code (Security PIN) Endpoints ----
+
+const verifyCodeSchema = z.object({
+  code: z.string().trim().min(1, "Enter a security code or PIN."),
+});
+
+router.post("/verify-code", async (req, res) => {
+  const input = validate(verifyCodeSchema, req.body);
+  const result = await findTenantByAccessCode(input.code);
+  if (!result || !result.valid) {
+    const message = result?.message || "Invalid or expired security code / PIN.";
+    throw new HttpError(404, message, { code: result?.problem || "INVALID_ACCESS_CODE" });
+  }
+  res.json({
+    valid: true,
+    code: result.code.code,
+    tenant: {
+      id: result.code.tenantId,
+      name: result.code.tenantName,
+      slug: result.code.tenantSlug,
+    },
+  });
+});
+
+const codeLoginSchema = z.object({
+  code: z.string().trim().min(1, "Security code or PIN is required."),
+  email: email.optional(),
+  password: z.string().optional(),
+});
+
+router.post("/code-login", async (req, res) => {
+  const input = validate(codeLoginSchema, req.body);
+  const result = await findTenantByAccessCode(input.code);
+  if (!result || !result.valid) {
+    throw new HttpError(401, result?.message || "Invalid or expired security code / PIN.", { code: result?.problem || "INVALID_ACCESS_CODE" });
+  }
+
+  const tenantSlug = result.code.tenantSlug;
+  const tenantId = result.code.tenantId;
+
+  if (input.email) {
+    const candidates = await accountsByEmail(input.email, tenantSlug);
+    if (!candidates.length) {
+      throw new HttpError(404, "No account found with this email in this workspace. You can create an account using this PIN.", { code: "ACCOUNT_NOT_FOUND" });
+    }
+    const match = candidates[0];
+    if (input.password && !(await bcrypt.compare(input.password, match.password_hash))) {
+      throw new HttpError(401, "Incorrect password.", { code: "INVALID_CREDENTIALS" });
+    }
+    const problem = accessProblem(match);
+    if (problem) throw new HttpError(problem.status, problem.message, { code: problem.code });
+
+    await recordAccessCodeUsage(result.code.id);
+    await runInTenant(tenantId, () => completeLogin(res, match));
+    return;
+  }
+
+  res.json({
+    ok: true,
+    code: result.code.code,
+    tenant: {
+      id: result.code.tenantId,
+      name: result.code.tenantName,
+      slug: result.code.tenantSlug,
+    },
+  });
+});
+
+const registerWithCodeSchema = z.object({
+  code: z.string().trim().min(1, "Security code or PIN is required."),
+  name: z.string().trim().min(1, "Name is required.").max(120),
+  email,
+  password: z.string().min(8, "Use at least 8 characters.").max(128),
+  jobTitle: z.string().trim().max(120).nullable().optional(),
+});
+
+router.post("/register-with-code", async (req, res) => {
+  const input = validate(registerWithCodeSchema, req.body);
+  const result = await findTenantByAccessCode(input.code);
+  if (!result || !result.valid) {
+    throw new HttpError(401, result?.message || "Invalid or expired security code / PIN.", { code: result?.problem || "INVALID_ACCESS_CODE" });
+  }
+  const tenantId = result.code.tenantId;
+
+  const newUserRow = await runInTenant(tenantId, async () => {
+    const db = getDb();
+    const tenant = await db("tenants").where({ id: tenantId }).first();
+    if (!tenant) throw new HttpError(404, "Workspace not found.");
+    if (tenant.status !== "active") throw new HttpError(403, "This workspace is currently suspended.", { code: "TENANT_SUSPENDED" });
+
+    // Validate security policy for password
+    const settings = resolveSettings(tenant.settings);
+    assertPasswordAllowed(input.password, settings.security);
+
+    // Create user in this tenant workspace
+    const userId = await createUser(db, {
+      tenantId,
+      name: input.name,
+      email: input.email,
+      password: input.password,
+      jobTitle: input.jobTitle || null,
+      role: "member",
+      mustChangePassword: false,
+    });
+
+    return await findUserWithTenant(db, { "u.id": userId });
+  });
+
+  await recordAccessCodeUsage(result.code.id);
+  await runInTenant(tenantId, () => completeLogin(res, newUserRow));
 });
 
 /** Each account (with its tenant) for a list of user ids, in order. */
@@ -199,8 +314,20 @@ router.post("/login", async (req, res) => {
   const input = validate(loginSchema, req.body);
   const key = `${req.ip ?? "unknown"}|${input.email}`;
   checkLock(key);
+
+  let targetWorkspace = input.workspace;
+  let codeEntry = null;
+  if (input.code) {
+    const codeResult = await findTenantByAccessCode(input.code);
+    if (!codeResult || !codeResult.valid) {
+      throw new HttpError(401, codeResult?.message || "Invalid or expired security code / PIN.", { code: codeResult?.problem || "INVALID_ACCESS_CODE" });
+    }
+    targetWorkspace = codeResult.code.tenantSlug;
+    codeEntry = codeResult.code;
+  }
+
   // Emails are unique per workspace: with a workspace there is at most one account, without one there may be several.
-  const candidates = await accountsByEmail(input.email, input.workspace);
+  const candidates = await accountsByEmail(input.email, targetWorkspace);
   const matches = [];
   for (const candidate of candidates) {
     if (await bcrypt.compare(input.password, candidate.password_hash)) matches.push(candidate);
@@ -223,6 +350,11 @@ router.post("/login", async (req, res) => {
   const row = usable[0] ?? matches[0];
   const problem = accessProblem(row);
   if (problem) throw new HttpError(problem.status, problem.message, { code: problem.code });
+
+  if (codeEntry) {
+    await recordAccessCodeUsage(codeEntry.id);
+  }
+
   // The rest runs in the account's own database (its tenant may have one).
   await runInTenant(row.tenant_id, () => completeLogin(res, row));
 });

@@ -1421,6 +1421,66 @@ const migrations = {
       }
     },
   },
+
+  // Tenant security access codes / PINs: random unique codes managed by tenant admins,
+  // used for user creation and direct tenant login, looked up via a common platform table.
+  "021_tenant_access_codes": {
+    async up(knex) {
+      if (!(await knex.schema.hasTable("tenant_access_codes"))) {
+        await knex.schema.createTable("tenant_access_codes", table => {
+          table.increments("id").primary();
+          table.integer("tenant_id").unsigned().notNullable().references("id").inTable("tenants").onDelete("CASCADE");
+          table.string("tenant_name", 120).notNullable();
+          table.string("tenant_slug", 60).notNullable();
+          table.string("code", 32).notNullable().unique();
+          table.string("name", 80).notNullable().defaultTo("Tenant Security PIN");
+          table.string("type", 30).notNullable().defaultTo("login_pin"); // login_pin | registration | general
+          table.string("description", 255).nullable();
+          table.boolean("is_active").notNullable().defaultTo(true);
+          table.boolean("is_deleted").notNullable().defaultTo(false); // Soft delete: true or false only
+          table.integer("usage_count").notNullable().defaultTo(0);
+          table.integer("max_uses").nullable(); // null = unlimited
+          table.string("expires_at", 30).nullable(); // ISO string, null = never
+          table.string("last_used_at", 30).nullable();
+          table.integer("created_by").unsigned().nullable().references("id").inTable("users").onDelete("SET NULL");
+          table.string("created_at", 30).notNullable();
+          table.string("updated_at", 30).notNullable();
+          table.index(["code", "is_deleted", "is_active"]);
+          table.index(["tenant_id", "is_deleted"]);
+          table.index(["tenant_slug"]);
+        });
+      }
+
+      // Seed an active security PIN for existing tenants that do not have one yet
+      if (await knex.schema.hasTable("tenants")) {
+        const tenants = await knex("tenants").select("id", "name", "slug");
+        const now = new Date().toISOString();
+        for (const t of tenants) {
+          const existing = await knex("tenant_access_codes").where({ tenant_id: t.id, is_deleted: false }).first();
+          if (!existing) {
+            const randomSuffix = Math.floor(100000 + Math.random() * 900000);
+            await knex("tenant_access_codes").insert({
+              tenant_id: t.id,
+              tenant_name: t.name,
+              tenant_slug: t.slug,
+              code: `TF-${randomSuffix}`,
+              name: "Default Security PIN",
+              type: "login_pin",
+              is_active: true,
+              is_deleted: false,
+              usage_count: 0,
+              created_at: now,
+              updated_at: now,
+            });
+          }
+        }
+      }
+    },
+
+    async down(knex) {
+      await knex.schema.dropTableIfExists("tenant_access_codes");
+    },
+  },
 };
 
 /** In-code migration source: no migration files or ESM loader quirks. */

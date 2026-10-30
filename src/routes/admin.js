@@ -38,6 +38,7 @@ import { applySettingsPatch, DEFAULT_SETTINGS, settingsSchema } from "../service
 import * as permissionsService from "../services/permissions.js";
 import { standaloneFileName, writeStandaloneZip } from "../services/standaloneExport.js";
 import { assertSeatAvailable, FEATURES, toTenant } from "../services/tenants.js";
+import { createTenantAccessCode } from "../services/tenantAccessCodes.js";
 import { processCelebrations } from "../services/celebrations.js";
 import { ADMIN_PERMISSION, expireSubscriptionNotices, processSubscriptionNotices, publishDueBroadcasts, sendSubscriptionNotice } from "../services/broadcasts.js";
 import { seedTenantRoles, usersWithPermission } from "../services/permissions.js";
@@ -1015,8 +1016,12 @@ router.post("/tenants", requireAdmin, async (req, res) => {
     });
     return { tenantId: id, ownerId: owner };
   });
+  const createdTenant = await findTenant(db, tenantId);
+  if (createdTenant) {
+    await createTenantAccessCode({ id: tenantId, name: createdTenant.name, slug: createdTenant.slug });
+  }
   await audit(req, "create_tenant", `tenants#${tenantId}`, { name: input.name, owner: input.owner.email, industry: input.industry ?? DEFAULT_INDUSTRY, features: input.features.join(" ") }, tenantId);
-  res.status(201).json({ ...(await findTenant(db, tenantId)), ownerId });
+  res.status(201).json({ ...createdTenant, ownerId });
 });
 
 /** The row a new tenant starts with (registry, and the copy in a dedicated database). */
@@ -1103,7 +1108,10 @@ router.patch("/tenants/:id", requireAdmin, async (req, res) => {
     if (Object.keys(errors).length) throw new HttpError(422, "Please fix the highlighted fields.", { code: "VALIDATION_ERROR", errors });
   }
   const changes = {};
-  if (input.name !== undefined) changes.name = input.name;
+  if (input.name !== undefined) {
+    changes.name = input.name;
+    await getPlatformDb()("tenant_access_codes").where({ tenant_id: id }).update({ tenant_name: input.name });
+  }
   if (input.status !== undefined) changes.status = input.status;
   if (input.industry !== undefined) changes.industry = input.industry;
   if (input.features !== undefined) changes.features = JSON.stringify(input.features);

@@ -10,6 +10,7 @@ import { applySettingsPatch, resolveSettings, validateSettings, WORKSPACE_KEYS }
 import { subscriptionSummary } from "../services/subscriptionDates.js";
 import { effectiveFeatures, parseFeatures } from "../services/tenants.js";
 import { updateTenantRow } from "../services/tenantDatabases.js";
+import { getActiveTenantAccessCode, regenerateTenantAccessCode } from "../services/tenantAccessCodes.js";
 import { HttpError, nowIso } from "../utils/http.js";
 
 const router = Router();
@@ -107,6 +108,20 @@ router.get("/overview", requirePermission(...ADMIN_PERMISSIONS), async (req, res
     openPasswordRequests: openResets ? Number(openResets[0]?.count ?? 0) : null,
     recentActivity: audit?.map(entry => ({ id: entry.id, action: entry.action, target: entry.target, actor: entry.actor_name ?? null, createdAt: entry.created_at })) ?? null,
   });
+});
+
+// Tenant access code (PIN) management for workspace admins
+router.get("/access-code", requirePermission("workspace.settings.manage", "workspace.users.manage"), async (req, res) => {
+  const code = await getActiveTenantAccessCode(req.user.tenant_id);
+  res.json(code);
+});
+
+router.post("/access-code/regenerate", requirePermission("workspace.settings.manage", "workspace.users.manage"), async (req, res) => {
+  const db = getDb();
+  const code = await regenerateTenantAccessCode(req.user.tenant_id, req.user.id);
+  await recordTenantAudit(db, req, "access_code.regenerate", `Regenerated workspace security PIN to ${code.code}`);
+  publish({ tenantId: req.user.tenant_id }, "workspace.access_code_updated", { code: code.code });
+  res.json(code);
 });
 
 export default router;

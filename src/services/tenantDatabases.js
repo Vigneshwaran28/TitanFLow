@@ -15,7 +15,7 @@ import { existingTables, getCatalog, syncTables } from "../db/schemaCatalog.js";
 import { HttpError } from "../utils/http.js";
 
 /** Tables every workspace has, whatever its modules: people, roles, notifications, audit, and the inbox state. */
-export const CORE_TABLES = Object.freeze(["tenants", "users", "roles", "user_roles", "teams", "team_members", "notifications", "tenant_audit", "password_resets", "celebration_notices", "provider_broadcast_reads", "access_rules", "access_rule_users", "meetings", "meeting_participants"]);
+export const CORE_TABLES = Object.freeze(["tenants", "tenant_access_codes", "users", "roles", "user_roles", "teams", "team_members", "notifications", "tenant_audit", "password_resets", "celebration_notices", "provider_broadcast_reads", "access_rules", "access_rule_users", "meetings", "meeting_participants"]);
 
 /**
  * The tables each module brings. Shared tables are listed under every module that reads them: billing invoices sales
