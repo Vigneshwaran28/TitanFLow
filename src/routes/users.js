@@ -13,7 +13,7 @@ import { assertEmailAllowed, assertPasswordAllowed, emailDomainProblem } from ".
 import { recordTenantAudit } from "../services/tenantAudit.js";
 import { assertSeatAvailable } from "../services/tenants.js";
 import { ageOf, dateOfBirthSchema, joinedOnSchema } from "../services/personDates.js";
-import { createUser, resolveRoleIds, ROLES } from "../services/users.js";
+import { createUser, generateUniqueUserLoginCode, resolveRoleIds, ROLES } from "../services/users.js";
 import { HttpError, nowIso, parseId, validate } from "../utils/http.js";
 
 const router = Router();
@@ -60,6 +60,7 @@ const toManagedUser = (row, roles) => ({
   isActive: Boolean(row.is_active),
   mustChangePassword: Boolean(row.must_change_password),
   lastLoginAt: row.last_login_at ?? null,
+  loginCode: row.login_code ?? null,
   createdAt: row.created_at,
 });
 
@@ -108,6 +109,17 @@ router.get("/", async (req, res) => {
     db("tenants").where({ id: tenantId }).first(),
     rolesByUser(db, tenantId),
   ]);
+
+  // Ensure any existing user missing a login_code receives one
+  const missingCode = users.filter(user => !user.login_code);
+  if (missingCode.length > 0) {
+    for (const user of missingCode) {
+      const code = await generateUniqueUserLoginCode(db);
+      await db("users").where({ id: user.id }).update({ login_code: code });
+      user.login_code = code;
+    }
+  }
+
   res.json({
     users: users.map(user => toManagedUser(user, roles.get(user.id))),
     seats: { used: users.filter(user => user.is_active).length, limit: tenant?.max_users ?? null },
@@ -209,6 +221,26 @@ router.post("/:id/sign-out", async (req, res) => {
   disconnectUser(id, "Signed out by an administrator");
   await recordTenantAudit(db, req, "user.sign_out", user.name);
   res.status(204).end();
+});
+
+/** Regenerates a unique login key code for a specific user. */
+router.post("/:id/login-code/regenerate", async (req, res) => {
+  const id = parseId(req.params.id);
+  const db = getDb();
+  const tenantId = req.user.tenant_id;
+  const user = await findMember(db, tenantId, id);
+
+  const currentRoles = await loadRoles(db, tenantId, id);
+  const isOwner = currentRoles.some(role => role.key === "owner");
+  if (isOwner && !req.access.isOwner) {
+    throw forbidden("Only an owner can regenerate another owner's login code.");
+  }
+
+  const newCode = await generateUniqueUserLoginCode(db);
+  await db("users").where({ id, tenant_id: tenantId }).update({ login_code: newCode });
+  await recordTenantAudit(db, req, "user.regenerate_login_code", user.name, { code: newCode });
+
+  res.json({ ok: true, id, loginCode: newCode });
 });
 
 // ---- Bulk import: many accounts at once (from a CSV the web app parses), all with one temporary password ----

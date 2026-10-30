@@ -197,7 +197,9 @@ router.post("/verify-code", async (req, res) => {
   }
   res.json({
     valid: true,
+    type: result.type || "tenant",
     code: result.code.code,
+    user: result.user ? { id: result.user.id, name: result.user.name, email: result.user.email } : null,
     tenant: {
       id: result.code.tenantId,
       name: result.code.tenantName,
@@ -222,8 +224,11 @@ router.post("/code-login", async (req, res) => {
   const tenantSlug = result.code.tenantSlug;
   const tenantId = result.code.tenantId;
 
-  if (input.email) {
-    const candidates = await accountsByEmail(input.email, tenantSlug);
+  // If this code belongs directly to a user in users table, default email to that user
+  const targetEmail = input.email || (result.type === "user" ? result.user.email : null);
+
+  if (targetEmail) {
+    const candidates = await accountsByEmail(targetEmail, tenantSlug);
     if (!candidates.length) {
       throw new HttpError(404, "No account found with this email in this workspace. You can create an account using this PIN.", { code: "ACCOUNT_NOT_FOUND" });
     }
@@ -234,14 +239,18 @@ router.post("/code-login", async (req, res) => {
     const problem = accessProblem(match);
     if (problem) throw new HttpError(problem.status, problem.message, { code: problem.code });
 
-    await recordAccessCodeUsage(result.code.id);
+    if (result.code.id) {
+      await recordAccessCodeUsage(result.code.id);
+    }
     await runInTenant(tenantId, () => completeLogin(res, match));
     return;
   }
 
   res.json({
     ok: true,
+    type: result.type || "tenant",
     code: result.code.code,
+    user: result.user ? { id: result.user.id, name: result.user.name, email: result.user.email } : null,
     tenant: {
       id: result.code.tenantId,
       name: result.code.tenantName,

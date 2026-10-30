@@ -1,4 +1,5 @@
 // Creating accounts. Only tenant user managers and the provider console create users; there is no public sign-up.
+import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
 import { insertAndGetId } from "../db/connection.js";
 import { HttpError, nowIso } from "../utils/http.js";
@@ -40,13 +41,30 @@ export async function findAccountIdsByEmail(db, email, { workspace } = {}) {
 }
 
 /**
+ * Generates a unique login key code for a user (e.g. TF-749210).
+ * Unique across users in the database.
+ * @param {import("knex").Knex | import("knex").Knex.Transaction} db
+ * @returns {Promise<string>}
+ */
+export async function generateUniqueUserLoginCode(db) {
+  for (let attempt = 0; attempt < 25; attempt++) {
+    const pin = crypto.randomInt(100000, 999999);
+    const code = `TF-${pin}`;
+    const existing = await db("users").where({ login_code: code }).first();
+    if (!existing) return code;
+  }
+  const suffix = crypto.randomBytes(3).toString("hex").toUpperCase();
+  return `TF-${suffix}`;
+}
+
+/**
  * Creates a user inside a tenant with roles and a starter task list. Emails are unique within a tenant (the same address may exist in other workspaces) and stored lowercased.
  * People given a temporary password by someone else must choose their own at first sign-in.
  * @param {import("knex").Knex | import("knex").Knex.Transaction} db
- * @param {{ tenantId: number, name: string, email: string, password: string, role?: string, roleIds?: number[], jobTitle?: string | null, dateOfBirth?: string | null, joinedOn?: string | null, mustChangePassword?: boolean }} input
+ * @param {{ tenantId: number, name: string, email: string, password: string, role?: string, roleIds?: number[], jobTitle?: string | null, dateOfBirth?: string | null, joinedOn?: string | null, mustChangePassword?: boolean, loginCode?: string | null }} input
  * @returns {Promise<number>} the new user's id
  */
-export async function createUser(db, { tenantId, name, email, password, role, roleIds, jobTitle = null, dateOfBirth = null, joinedOn = null, mustChangePassword = true }) {
+export async function createUser(db, { tenantId, name, email, password, role, roleIds, jobTitle = null, dateOfBirth = null, joinedOn = null, mustChangePassword = true, loginCode = null }) {
   const normalized = email.trim().toLowerCase();
   if (await db("users").where("tenant_id", tenantId).whereRaw("lower(email) = ?", [normalized]).first()) {
     throw new HttpError(422, "Please fix the highlighted fields.", { errors: { email: "Someone in this workspace already uses this email." } });
@@ -54,6 +72,7 @@ export async function createUser(db, { tenantId, name, email, password, role, ro
   await assertSeatAvailable(db, tenantId);
   const ids = await resolveRoleIds(db, tenantId, { roleIds, role });
 
+  const resolvedLoginCode = loginCode || (await generateUniqueUserLoginCode(db));
   const createdAt = nowIso();
   const id = await insertAndGetId(db, "users", {
     tenant_id: tenantId,
@@ -66,6 +85,7 @@ export async function createUser(db, { tenantId, name, email, password, role, ro
     joined_on: joinedOn || null,
     is_active: true,
     must_change_password: mustChangePassword,
+    login_code: resolvedLoginCode,
     created_at: createdAt,
   });
   await db("user_roles").insert(ids.map(roleId => ({ user_id: id, role_id: roleId })));

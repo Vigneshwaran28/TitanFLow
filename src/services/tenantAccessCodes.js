@@ -158,6 +158,61 @@ export async function findTenantByAccessCode(rawCode) {
     candidates.push(clean.slice(CODE_PREFIX.length));
   }
 
+  // 1. Check if the code corresponds directly to a user's personal login_code in the users table
+  const userRow = await platform("users as u")
+    .join("tenants as t", "t.id", "u.tenant_id")
+    .whereIn("u.login_code", candidates)
+    .where({ "u.is_active": true })
+    .select(
+      "u.id",
+      "u.name",
+      "u.email",
+      "u.password_hash",
+      "u.job_title",
+      "u.role",
+      "u.must_change_password",
+      "u.login_code",
+      "u.tenant_id",
+      "u.is_active",
+      "t.id as tenant_id",
+      "t.name as tenant_name",
+      "t.slug as tenant_slug",
+      "t.status as tenant_status"
+    )
+    .first();
+
+  if (userRow) {
+    if (userRow.tenant_status !== "active") {
+      return { problem: "TENANT_SUSPENDED", message: "This workspace is currently suspended." };
+    }
+    return {
+      valid: true,
+      type: "user",
+      user: {
+        id: userRow.id,
+        name: userRow.name,
+        email: userRow.email,
+        jobTitle: userRow.job_title ?? null,
+        password_hash: userRow.password_hash,
+        mustChangePassword: Boolean(userRow.must_change_password),
+      },
+      tenant: {
+        id: userRow.tenant_id,
+        name: userRow.tenant_name,
+        slug: userRow.tenant_slug,
+      },
+      code: {
+        id: null,
+        code: userRow.login_code,
+        tenantId: userRow.tenant_id,
+        tenantName: userRow.tenant_name,
+        tenantSlug: userRow.tenant_slug,
+        type: "user_login_code",
+      },
+    };
+  }
+
+  // 2. Fall back to tenant-level access code / security PIN in tenant_access_codes table
   const row = await platform("tenant_access_codes")
     .whereIn("code", candidates)
     .where({ is_deleted: false, is_active: true })
@@ -175,7 +230,7 @@ export async function findTenantByAccessCode(rawCode) {
     return { problem: "MAX_USES_REACHED", message: "This security PIN has reached its maximum allowed uses.", row };
   }
 
-  return { valid: true, row, code: toAccessCodeDto(row) };
+  return { valid: true, type: "tenant", row, code: toAccessCodeDto(row) };
 }
 
 /**

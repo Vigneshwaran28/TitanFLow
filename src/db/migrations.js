@@ -1481,6 +1481,46 @@ const migrations = {
       await knex.schema.dropTableIfExists("tenant_access_codes");
     },
   },
+
+  "022_user_login_codes": {
+    async up(knex) {
+      if (await knex.schema.hasTable("users")) {
+        const hasColumn = await knex.schema.hasColumn("users", "login_code");
+        if (!hasColumn) {
+          await knex.schema.alterTable("users", table => {
+            table.string("login_code", 32).nullable();
+            table.index(["login_code"]);
+          });
+        }
+
+        // Backfill existing users with unique login codes
+        const users = await knex("users").select("id", "login_code");
+        const usedCodes = new Set(users.map(u => u.login_code).filter(Boolean));
+        for (const user of users) {
+          if (!user.login_code) {
+            let code;
+            do {
+              const num = Math.floor(100000 + Math.random() * 900000);
+              code = `TF-${num}`;
+            } while (usedCodes.has(code));
+            usedCodes.add(code);
+            await knex("users").where({ id: user.id }).update({ login_code: code });
+          }
+        }
+      }
+    },
+
+    async down(knex) {
+      if (await knex.schema.hasTable("users")) {
+        const hasColumn = await knex.schema.hasColumn("users", "login_code");
+        if (hasColumn) {
+          await knex.schema.alterTable("users", table => {
+            table.dropColumn("login_code");
+          });
+        }
+      }
+    },
+  },
 };
 
 /** In-code migration source: no migration files or ESM loader quirks. */
