@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import jwt from "jsonwebtoken";
 import { readConfig } from "../config/store.js";
 import { getDb } from "../db/connection.js";
@@ -7,7 +8,7 @@ import { activeRulesByUser, effectivePermissions } from "../services/permissions
 import { sessionHoursOf } from "../services/securityPolicy.js";
 import { subscriptionExpired } from "../services/subscriptionDates.js";
 import { effectiveFeatures } from "../services/tenants.js";
-import { HttpError } from "../utils/http.js";
+import { HttpError, nowIso } from "../utils/http.js";
 
 // ---- Sessions: one per workspace, so one browser can be signed in to several workspaces side by side ----
 // Each workspace's sign-in lives in its own cookie (tf_s_<slug>). The web app says which workspace a request is
@@ -66,16 +67,87 @@ export function workspaceSessions(cookies) {
 export const verifySession = token => jwt.verify(token, secret());
 
 /**
+ * Tracks an active session in user_sessions and enforces the tenant's maxActiveSessions limit.
+ */
+export async function trackUserSession(db, { userId, tenantId, sid, settings, ip, userAgent }) {
+  if (!db || !sid) return;
+  try {
+    const hasTable = await db.schema.hasTable("user_sessions");
+    if (!hasTable) return;
+    const now = nowIso();
+    const hours = sessionHoursOf(settings);
+    const expiresAt = new Date(Date.now() + hours * 3_600_000).toISOString();
+
+    // 1. Clean up expired sessions for this user
+    await db("user_sessions")
+      .where({ user_id: userId })
+      .where("expires_at", "<", now)
+      .delete();
+
+    // 2. Enforce maxActiveSessions limit if configured by tenant admin
+    const maxActive = settings?.security?.maxActiveSessions;
+    if (typeof maxActive === "number" && maxActive > 0) {
+      const activeRows = await db("user_sessions")
+        .where({ user_id: userId })
+        .orderBy("id", "asc"); // oldest first
+      
+      if (activeRows.length >= maxActive) {
+        const toEvictCount = activeRows.length - maxActive + 1;
+        const toEvictIds = activeRows.slice(0, toEvictCount).map(r => r.id);
+        await db("user_sessions").whereIn("id", toEvictIds).delete();
+      }
+    }
+
+    // 3. Insert this new session
+    await db("user_sessions").insert({
+      tenant_id: tenantId,
+      user_id: userId,
+      session_id: sid,
+      ip_address: ip || null,
+      user_agent: (userAgent || "").slice(0, 255) || null,
+      created_at: now,
+      last_seen_at: now,
+      expires_at: expiresAt,
+    });
+  } catch (err) {
+    console.error("[auth] trackUserSession error:", err.message);
+  }
+}
+
+/**
  * Signs a person in to their workspace on this browser. Other workspaces' sessions are left alone.
  * @param {import("express").Response} res
- * @param {{ userId: number, slug: string, settings?: Object }} session - settings: the workspace's resolved settings (session length)
+ * @param {{ userId: number, slug: string, settings?: Object, tenantId?: number, req?: Object }} session
  */
-export function startSession(res, { userId, slug, settings }) {
+export function startSession(res, { userId, slug, settings, tenantId = null, req = null, isCodeLogin = false }) {
   const hours = sessionHoursOf(settings);
-  const token = jwt.sign({ sub: String(userId), ws: slug, iatMs: Date.now() }, secret(), { expiresIn: `${hours}h` });
+  const sid = crypto.randomUUID();
+  const token = jwt.sign({ sub: String(userId), ws: slug, sid, isCodeLogin: Boolean(isCodeLogin), iatMs: Date.now() }, secret(), { expiresIn: `${hours}h` });
   const options = cookieOptions(hours * 60 * 60 * 1000);
   res.cookie(SESSION_COOKIE, token, options);
   res.cookie(workspaceCookie(slug), token, options);
+
+  // Background active session recording in DB
+  const ip = req?.ip ?? null;
+  const userAgent = req?.get ? req.get("user-agent") : null;
+  const db = getDb();
+  if (db) {
+    Promise.resolve().then(async () => {
+      try {
+        let tId = tenantId;
+        if (!tId) {
+          const user = await db("users").where({ id: userId }).first("tenant_id");
+          tId = user?.tenant_id;
+        }
+        if (tId) {
+          await trackUserSession(db, { userId, tenantId: tId, sid, settings: resolveSettings(settings), ip, userAgent });
+        }
+      } catch (e) {
+        // Ignore session track error
+      }
+    });
+  }
+
   return token;
 }
 
@@ -85,6 +157,20 @@ export function startSession(res, { userId, slug, settings }) {
  */
 export function endSession(req, res, slug) {
   const latest = req.cookies?.[SESSION_COOKIE];
+  const token = (slug && req.cookies?.[workspaceCookie(slug)]) || latest;
+  if (token) {
+    try {
+      const payload = jwt.decode(token);
+      if (payload?.sid) {
+        const db = getDb();
+        if (db) {
+          Promise.resolve(db.schema.hasTable("user_sessions")).then(has => {
+            if (has) db("user_sessions").where({ session_id: payload.sid }).delete().catch(() => {});
+          }).catch(() => {});
+        }
+      }
+    } catch {}
+  }
   if (slug) res.clearCookie(workspaceCookie(slug), { path: "/" });
   const latestSlug = latest ? jwt.decode(latest)?.ws : null;
   if (!slug || !latestSlug || latestSlug === slug || latest === req.cookies?.[workspaceCookie(slug)]) res.clearCookie(SESSION_COOKIE, { path: "/" });
@@ -92,7 +178,16 @@ export function endSession(req, res, slug) {
 
 /** Signs out of every workspace on this browser. */
 export function endAllSessions(req, res) {
-  for (const { slug } of workspaceSessions(req.cookies)) res.clearCookie(workspaceCookie(slug), { path: "/" });
+  for (const { slug, token } of workspaceSessions(req.cookies)) {
+    try {
+      const payload = jwt.decode(token);
+      if (payload?.sid) {
+        const db = getDb();
+        if (db) db("user_sessions").where({ session_id: payload.sid }).delete().catch(() => {});
+      }
+    } catch {}
+    res.clearCookie(workspaceCookie(slug), { path: "/" });
+  }
   res.clearCookie(SESSION_COOKIE, { path: "/" });
 }
 
@@ -204,6 +299,29 @@ export async function loadSession(db, cookies, slug, authHeader) {
   }
   const problem = accessProblem(row) ?? sessionProblem(payload, row);
   if (problem) return { problem: { message: problem.message, code: problem.code }, drop: found.cookie };
+
+  // If session token has sid, verify user_sessions hasn't evicted it due to active session limit
+  if (payload.sid && db) {
+    try {
+      const hasSessionsTable = await db.schema.hasTable("user_sessions");
+      if (hasSessionsTable) {
+        const activeSession = await db("user_sessions").where({ session_id: payload.sid }).first();
+        if (!activeSession) {
+          const [{ count }] = await db("user_sessions").where({ user_id: row.id }).count({ count: "*" });
+          if (Number(count || 0) > 0) {
+            return {
+              problem: {
+                message: "Your session was ended because the active session limit for your workspace was reached on another device, or you were signed out.",
+                code: "SESSION_LIMIT_EXCEEDED",
+              },
+              drop: found.cookie,
+            };
+          }
+        }
+      }
+    } catch {}
+  }
+
   return { row, payload, cookie: found.cookie };
 }
 
@@ -219,7 +337,7 @@ export async function requireAuth(req, res, next) {
     if (session.drop) dropSession(req, res, session.drop);
     throw new HttpError(401, session.problem.message, { code: session.problem.code });
   }
-  const { row } = session;
+  const { row, payload } = session;
 
   req.user = {
     id: row.id,
@@ -230,6 +348,7 @@ export async function requireAuth(req, res, next) {
     created_at: row.created_at,
     tenant_id: row.tenant_id,
     must_change_password: Boolean(row.must_change_password),
+    is_code_login: Boolean(payload?.isCodeLogin),
     date_of_birth: row.date_of_birth,
     joined_on: row.joined_on,
     show_birthday: row.show_birthday,

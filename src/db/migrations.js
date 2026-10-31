@@ -1521,6 +1521,129 @@ const migrations = {
       }
     },
   },
+
+  "023_access_codes_and_sessions": {
+    async up(knex) {
+      // 1. Add is_code_login_enabled to users
+      if (await knex.schema.hasTable("users")) {
+        const hasCodeLoginEnabled = await knex.schema.hasColumn("users", "is_code_login_enabled");
+        if (!hasCodeLoginEnabled) {
+          await knex.schema.alterTable("users", table => {
+            table.boolean("is_code_login_enabled").notNullable().defaultTo(true);
+          });
+        }
+      }
+
+      // 2. Add user_id to tenant_access_codes and backfill
+      if (await knex.schema.hasTable("tenant_access_codes")) {
+        const hasUserId = await knex.schema.hasColumn("tenant_access_codes", "user_id");
+        if (!hasUserId) {
+          await knex.schema.alterTable("tenant_access_codes", table => {
+            table.integer("user_id").unsigned().nullable();
+            table.index(["user_id"]);
+          });
+        }
+
+        // Backfill any existing users into tenant_access_codes
+        if (await knex.schema.hasTable("users") && await knex.schema.hasTable("tenants")) {
+          const users = await knex("users as u")
+            .join("tenants as t", "t.id", "u.tenant_id")
+            .select("u.id", "u.name", "u.login_code", "u.tenant_id", "u.created_at", "t.name as tenant_name", "t.slug as tenant_slug");
+          
+          const now = new Date().toISOString();
+          for (const user of users) {
+            if (user.login_code) {
+              const existing = await knex("tenant_access_codes").where({ code: user.login_code }).first();
+              if (!existing) {
+                await knex("tenant_access_codes").insert({
+                  tenant_id: user.tenant_id,
+                  user_id: user.id,
+                  tenant_name: user.tenant_name,
+                  tenant_slug: user.tenant_slug,
+                  code: user.login_code,
+                  name: `${user.name} Login Code`,
+                  type: "user_login",
+                  is_active: true,
+                  is_deleted: false,
+                  usage_count: 0,
+                  created_at: user.created_at || now,
+                  updated_at: now,
+                });
+              } else if (!existing.user_id) {
+                await knex("tenant_access_codes").where({ id: existing.id }).update({
+                  user_id: user.id,
+                  type: "user_login",
+                  updated_at: now,
+                });
+              }
+            }
+          }
+        }
+      }
+
+      // 3. Create user_sessions table for active session limit tracking
+      if (!(await knex.schema.hasTable("user_sessions"))) {
+        await knex.schema.createTable("user_sessions", table => {
+          table.increments("id").primary();
+          table.integer("tenant_id").unsigned().notNullable();
+          table.integer("user_id").unsigned().notNullable();
+          table.string("session_id", 64).notNullable().unique();
+          table.string("ip_address", 64).nullable();
+          table.string("user_agent", 255).nullable();
+          table.string("created_at", 30).notNullable();
+          table.string("last_seen_at", 30).notNullable();
+          table.string("expires_at", 30).notNullable();
+          table.index(["user_id", "expires_at"]);
+          table.index(["tenant_id"]);
+          table.index(["session_id"]);
+        });
+      }
+
+      // 4. Add is_tenant_admin to password_resets
+      if (await knex.schema.hasTable("password_resets")) {
+        const hasCol = await knex.schema.hasColumn("password_resets", "is_tenant_admin");
+        if (!hasCol) {
+          await knex.schema.alterTable("password_resets", table => {
+            table.boolean("is_tenant_admin").notNullable().defaultTo(false);
+            table.index(["is_tenant_admin", "status"]);
+          });
+        }
+      }
+    },
+
+    async down(knex) {
+      if (await knex.schema.hasTable("password_resets")) {
+        const hasCol = await knex.schema.hasColumn("password_resets", "is_tenant_admin");
+        if (hasCol) {
+          await knex.schema.alterTable("password_resets", table => {
+            table.dropColumn("is_tenant_admin");
+          });
+        }
+      }
+
+      if (await knex.schema.hasTable("user_sessions")) {
+        await knex.schema.dropTableIfExists("user_sessions");
+      }
+
+      if (await knex.schema.hasTable("tenant_access_codes")) {
+        const hasUserId = await knex.schema.hasColumn("tenant_access_codes", "user_id");
+        if (hasUserId) {
+          await knex.schema.alterTable("tenant_access_codes", table => {
+            table.dropColumn("user_id");
+          });
+        }
+      }
+
+      if (await knex.schema.hasTable("users")) {
+        const hasCodeLoginEnabled = await knex.schema.hasColumn("users", "is_code_login_enabled");
+        if (hasCodeLoginEnabled) {
+          await knex.schema.alterTable("users", table => {
+            table.dropColumn("is_code_login_enabled");
+          });
+        }
+      }
+    },
+  },
 };
 
 /** In-code migration source: no migration files or ESM loader quirks. */

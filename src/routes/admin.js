@@ -43,7 +43,7 @@ import { processCelebrations } from "../services/celebrations.js";
 import { ADMIN_PERMISSION, expireSubscriptionNotices, processSubscriptionNotices, publishDueBroadcasts, sendSubscriptionNotice } from "../services/broadcasts.js";
 import { seedTenantRoles, usersWithPermission } from "../services/permissions.js";
 import { disconnectTenantSockets, disconnectUser } from "../services/realtime.js";
-import { subscriptionExpired, subscriptionSummary } from "../services/subscriptionDates.js";
+import { closeOpenResets, expireStaleLinks, hashResetToken, newResetToken, OPEN_STATUSES } from "../services/passwordResets.js";
 import { createUser, ROLES } from "../services/users.js";
 import { HttpError, nowIso, parseId, validate } from "../utils/http.js";
 import { RESERVED_SLUGS } from "../services/tenants.js";
@@ -643,6 +643,101 @@ router.post("/users/:id/password", requireAdmin, async (req, res) => {
   await db("users").where({ id }).update({ password_hash: await bcrypt.hash(password, 10), password_changed_at: nowIso() });
   runInTenant(user.tenant_id, () => disconnectUser(id, "Password changed"));
   await audit(req, "reset_password", `users#${id}`, { email: user.email }, user.tenant_id);
+  res.status(204).end();
+});
+
+const adminResetLinkSchema = z.object({
+  expiresInHours: z.number().int().min(1).max(72).default(24),
+  tenantId: z.number().int().positive().optional(),
+});
+
+/**
+ * Returns tenant admin password reset requests across all workspaces for Bunny overall admin.
+ */
+router.get("/password-requests", requireAdmin, async (req, res) => {
+  const db = getDb();
+  await expireStaleLinks(db);
+  const rows = await db("password_resets as pr")
+    .join("users as u", "u.id", "pr.user_id")
+    .join("tenants as t", "t.id", "pr.tenant_id")
+    .where("pr.is_tenant_admin", true)
+    .whereIn("pr.status", OPEN_STATUSES)
+    .select(
+      "pr.id",
+      "pr.tenant_id",
+      "pr.user_id",
+      "pr.status",
+      "pr.requested_at",
+      "pr.requested_ip",
+      "pr.issued_at",
+      "pr.expires_at",
+      "u.name as user_name",
+      "u.email as user_email",
+      "u.job_title as user_job_title",
+      "t.name as tenant_name",
+      "t.slug as tenant_slug"
+    )
+    .orderByRaw("coalesce(pr.requested_at, pr.created_at) desc");
+
+  res.json(rows.map(r => ({
+    id: r.id,
+    status: r.status,
+    requestedAt: r.requested_at ?? null,
+    requestedIp: r.requested_ip ?? null,
+    issuedAt: r.issued_at ?? null,
+    expiresAt: r.expires_at ?? null,
+    user: { id: r.user_id, name: r.user_name, email: r.user_email, jobTitle: r.user_job_title ?? null },
+    tenant: { id: r.tenant_id, name: r.tenant_name, slug: r.tenant_slug },
+  })));
+});
+
+/**
+ * Generates a secure one-time password reset link for a tenant admin or user in /bunny.
+ */
+router.post("/users/:id/reset-link", requireAdmin, async (req, res) => {
+  const id = parseId(req.params.id);
+  const { expiresInHours, tenantId: bodyTenantId } = validate(adminResetLinkSchema, req.body ?? {});
+  if (!req.query.tenantId && bodyTenantId) {
+    req.query.tenantId = String(bodyTenantId);
+  }
+  const { user, db } = await findUser(req, id);
+  const tenantId = user.tenant_id || bodyTenantId;
+  if (!user.is_active) throw new HttpError(422, "This account is deactivated. Reactivate it first.", { code: "USER_INACTIVE" });
+
+  const token = newResetToken();
+  const now = nowIso();
+  const expiresAt = new Date(Date.now() + expiresInHours * 60 * 60 * 1000).toISOString();
+  const issued = {
+    status: "issued",
+    token_hash: hashResetToken(token),
+    issued_at: now,
+    expires_at: expiresAt,
+    used_at: null,
+    is_tenant_admin: true,
+  };
+
+  await db.transaction(async trx => {
+    await expireStaleLinks(trx, { user_id: id });
+    const open = await trx("password_resets").where({ user_id: id, tenant_id: tenantId }).whereIn("status", OPEN_STATUSES).orderBy("id", "desc").first();
+    if (open) {
+      await trx("password_resets").where({ id: open.id }).update(issued);
+      await closeOpenResets(trx, id, "expired", { exceptId: open.id });
+    } else {
+      await insertAndGetId(trx, "password_resets", { tenant_id: tenantId, user_id: id, created_at: now, ...issued });
+    }
+  });
+
+  await audit(req, "issue_reset_link", `users#${id}`, { email: user.email, expiresInHours }, tenantId);
+  res.status(201).json({ url: `/reset-password/${token}`, token, expiresAt });
+});
+
+router.post("/password-requests/:id/dismiss", requireAdmin, async (req, res) => {
+  const id = parseId(req.params.id);
+  const db = getDb();
+  const request = await db("password_resets").where({ id }).first();
+  if (!request) throw new HttpError(404, "Request not found.");
+  await db("password_resets").where({ id }).update({ status: "dismissed" });
+  await audit(req, "dismiss_reset_request", `password_resets#${id}`, { userId: request.user_id }, request.tenant_id);
   res.status(204).end();
 });
 

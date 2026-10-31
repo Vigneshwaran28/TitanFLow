@@ -22,7 +22,7 @@ import { ACCENTS, imageUrlSchema, normalizeCss, resolveSettings, STYLES, TOUR_KE
 import { avatarUrlOf } from "../services/avatars.js";
 import { notifyUsers } from "../services/notify.js";
 import { closeOpenResets, expireStaleLinks, hashResetToken, maskEmail, OPEN_STATUSES, TOKEN_PATTERN } from "../services/passwordResets.js";
-import { usersWithPermission } from "../services/permissions.js";
+import { parsePermissions, rolesByUser, usersWithPermission } from "../services/permissions.js";
 import { createUser, findAccountIdsByEmail } from "../services/users.js";
 import { findTenantByAccessCode, recordAccessCodeUsage } from "../services/tenantAccessCodes.js";
 import { forEachDatabase, runInTenant, runInWorkspace } from "../services/tenantDatabases.js";
@@ -123,12 +123,10 @@ const readPreferences = json => {
   }
 };
 
-const passwordSchema = z
-  .object({
-    currentPassword: z.string().min(1, "Current password is required."),
-    newPassword: z.string().min(8, "Use at least 8 characters.").max(128),
-  })
-  .refine(value => value.newPassword !== value.currentPassword, { path: ["newPassword"], message: "Choose a password different from the current one." });
+const passwordChangeSchema = z.object({
+  currentPassword: z.string().optional(),
+  newPassword: z.string().min(8, "Use at least 8 characters.").max(128),
+});
 
 // ---- Sign-in throttling: 8 wrong passwords for one email from one IP locks that pair for 15 minutes. ----
 const MAX_FAILURES = 8;
@@ -167,14 +165,14 @@ export function toUser(row) {
   };
 }
 
-/** The signed-in user, their workspace and its modules, and what they're allowed to do. */
-const toSession = (user, tenant, access) => ({
+const toSession = (user, tenant, access, isCodeLogin = false) => ({
   ...toUser(user),
   tenant,
   roles: access.roles,
   permissions: access.permissions,
   isOwner: access.isOwner,
   mustChangePassword: Boolean(user.must_change_password),
+  isCodeLogin: Boolean(isCodeLogin || user.is_code_login),
 });
 
 // Accounts are created by workspace admins, or self-registered using a tenant security PIN/access code.
@@ -224,9 +222,31 @@ router.post("/code-login", async (req, res) => {
   const tenantSlug = result.code.tenantSlug;
   const tenantId = result.code.tenantId;
 
-  // If this code belongs directly to a user in users table, default email to that user
-  const targetEmail = input.email || (result.type === "user" ? result.user.email : null);
+  // Direct user login using their personal access code
+  if (result.type === "user" && result.user) {
+    const userRow = await runInTenant(tenantId, async () => {
+      const db = getDb();
+      return await findUserWithTenant(db, { "u.id": result.user.id });
+    });
+    if (!userRow) throw new HttpError(404, "User account not found.", { code: "ACCOUNT_NOT_FOUND" });
+    if (userRow.is_code_login_enabled === false) {
+      throw new HttpError(403, "Login with access code is disabled for this account.", { code: "USER_CODE_DISABLED" });
+    }
+    if (input.password && !(await bcrypt.compare(input.password, userRow.password_hash))) {
+      throw new HttpError(401, "Incorrect password.", { code: "INVALID_CREDENTIALS" });
+    }
+    const problem = accessProblem(userRow);
+    if (problem) throw new HttpError(problem.status, problem.message, { code: problem.code });
 
+    if (result.code.id) {
+      await recordAccessCodeUsage(result.code.id);
+    }
+    await runInTenant(tenantId, () => completeLogin(res, userRow, req, true));
+    return;
+  }
+
+  // Tenant-level security PIN
+  const targetEmail = input.email || null;
   if (targetEmail) {
     const candidates = await accountsByEmail(targetEmail, tenantSlug);
     if (!candidates.length) {
@@ -242,7 +262,7 @@ router.post("/code-login", async (req, res) => {
     if (result.code.id) {
       await recordAccessCodeUsage(result.code.id);
     }
-    await runInTenant(tenantId, () => completeLogin(res, match));
+    await runInTenant(tenantId, () => completeLogin(res, match, req));
     return;
   }
 
@@ -365,19 +385,19 @@ router.post("/login", async (req, res) => {
   }
 
   // The rest runs in the account's own database (its tenant may have one).
-  await runInTenant(row.tenant_id, () => completeLogin(res, row));
+  await runInTenant(row.tenant_id, () => completeLogin(res, row, req, Boolean(codeEntry)));
 });
 
-async function completeLogin(res, row) {
+async function completeLogin(res, row, req = null, isCodeLogin = false) {
   const db = getDb();
   const tenant = tenantFromRow(row);
   const access = await loadAccess(db, row.id, tenant.features);
   const maintenance = await workspaceMaintenance(db, row.tenant_maintenance);
   if (maintenance.active && !bypassesMaintenance(maintenance.active, access)) throw maintenanceError(maintenance.active);
   // Only this workspace's session is set: others this browser is signed in to stay signed in.
-  const token = startSession(res, { userId: row.id, slug: tenant.slug, settings: tenant.settings });
+  const token = startSession(res, { userId: row.id, slug: tenant.slug, settings: tenant.settings, tenantId: row.tenant_id, req, isCodeLogin });
   await db("users").where({ id: row.id }).update({ last_login_at: nowIso() });
-  res.json({ ...toSession(row, tenant, access), token, maintenance });
+  res.json({ ...toSession(row, tenant, access, isCodeLogin), token, maintenance });
 }
 
 // Signs out of the workspace the request is for (X-Workspace / ?ws=, or body.workspace); { all: true } signs out
@@ -437,7 +457,7 @@ async function describeSession(req, res, slug, latest) {
 
 // maintenance: { active, upcoming } — active only reaches owners and admins a window lets in (everyone else gets 503).
 router.get("/me", requireAuth, (req, res) => {
-  res.json({ ...toSession(req.user, req.tenant, req.access), maintenance: req.maintenance });
+  res.json({ ...toSession(req.user, req.tenant, req.access, req.user.is_code_login), maintenance: req.maintenance });
 });
 
 router.patch("/me", requireAuth, async (req, res) => {
@@ -452,7 +472,7 @@ router.patch("/me", requireAuth, async (req, res) => {
     changes.preferences = JSON.stringify({ ...readPreferences(current?.preferences), avatarUrl: input.avatarUrl || "" });
   }
   await db("users").where({ id: req.user.id }).update(changes);
-  res.json(toSession(await db("users").where({ id: req.user.id }).first(), req.tenant, req.access));
+  res.json(toSession(await db("users").where({ id: req.user.id }).first(), req.tenant, req.access, req.user.is_code_login));
 });
 
 /**
@@ -482,17 +502,30 @@ router.patch("/me/preferences", requireAuth, async (req, res) => {
 
 /** Changing the password also clears a "choose a new password" requirement from a temporary one. */
 router.post("/me/password", requireAuth, async (req, res) => {
-  const input = validate(passwordSchema, req.body);
+  const input = validate(passwordChangeSchema, req.body);
   const db = getDb();
   const user = await db("users").where({ id: req.user.id }).first();
-  if (!(await bcrypt.compare(input.currentPassword, user.password_hash))) {
-    throw new HttpError(422, "Please fix the highlighted fields.", { errors: { currentPassword: "Current password is incorrect." } });
+  if (!user) throw new HttpError(404, "User account not found.");
+
+  const isFirstTimeCodeLogin = Boolean(req.user.is_code_login && user.must_change_password);
+
+  if (!isFirstTimeCodeLogin) {
+    if (!input.currentPassword) {
+      throw new HttpError(422, "Please fix the highlighted fields.", { errors: { currentPassword: "Current password is required." } });
+    }
+    if (!(await bcrypt.compare(input.currentPassword, user.password_hash))) {
+      throw new HttpError(422, "Please fix the highlighted fields.", { errors: { currentPassword: "Current password is incorrect." } });
+    }
+    if (input.newPassword === input.currentPassword) {
+      throw new HttpError(422, "Please fix the highlighted fields.", { errors: { newPassword: "Choose a password different from the current one." } });
+    }
   }
+
   assertPasswordAllowed(req.tenant.settings.security, input.newPassword, "newPassword");
   await db("users").where({ id: user.id }).update({ password_hash: await bcrypt.hash(input.newPassword, 10), must_change_password: false, password_changed_at: nowIso() });
   // Other devices are signed out; this one gets a fresh session.
   disconnectUser(user.id, "Password changed");
-  startSession(res, { userId: user.id, slug: req.tenant.slug, settings: req.tenant.settings });
+  startSession(res, { userId: user.id, slug: req.tenant.slug, settings: req.tenant.settings, tenantId: user.tenant_id, req, isCodeLogin: false });
   res.status(204).end();
 });
 
@@ -539,18 +572,37 @@ const asSelf = user => ({ user: { id: user.id, tenant_id: user.tenant_id } });
 async function recordResetRequest(db, user, ip) {
   const now = nowIso();
   await expireStaleLinks(db, { user_id: user.id });
+
+  // Determine if this user is a tenant admin (Owner, or holds workspace.users.manage or workspace.roles.manage)
+  const roles = (await rolesByUser(db, user.tenant_id)).get(user.id) ?? [];
+  const isTenantAdmin = user.role === "admin" || roles.some(r => r.key === "owner" || r.key === "admin" || parsePermissions(r.permissions).includes("workspace.users.manage") || parsePermissions(r.permissions).includes("workspace.roles.manage"));
+
   const open = await db("password_resets").where({ user_id: user.id }).whereIn("status", OPEN_STATUSES).orderBy("id", "desc").first();
   let requestId;
   if (open) {
     requestId = open.id;
-    await db("password_resets").where({ id: open.id }).update({ requested_at: now, requested_ip: ip });
+    await db("password_resets").where({ id: open.id }).update({ requested_at: now, requested_ip: ip, is_tenant_admin: Boolean(isTenantAdmin) });
   } else {
-    requestId = await insertAndGetId(db, "password_resets", { tenant_id: user.tenant_id, user_id: user.id, status: "requested", requested_ip: ip, requested_at: now, created_at: now });
+    requestId = await insertAndGetId(db, "password_resets", {
+      tenant_id: user.tenant_id,
+      user_id: user.id,
+      status: "requested",
+      is_tenant_admin: Boolean(isTenantAdmin),
+      requested_ip: ip,
+      requested_at: now,
+      created_at: now,
+    });
   }
-  const admins = await usersWithPermission(db, user.tenant_id, "workspace.users.manage");
-  await notifyUsers(db, admins, { title: `${user.name} asked for a password reset`, body: "Open Manage users to send them a one-time reset link or set a temporary password.", actorId: user.id });
-  publish({ tenantId: user.tenant_id, permission: "workspace.users.manage" }, "password_reset.requested", { requestId });
-  await recordTenantAudit(db, asSelf(user), "user.password_reset_request", user.name, { ip });
+
+  // Only notify workspace admins if the user is a regular member/user (NOT a tenant admin).
+  // Tenant admin reset requests are handled exclusively by the overall platform admin in /bunny.
+  if (!isTenantAdmin) {
+    const admins = await usersWithPermission(db, user.tenant_id, "workspace.users.manage");
+    await notifyUsers(db, admins, { title: `${user.name} asked for a password reset`, body: "Open Manage users to send them a one-time reset link or set a temporary password.", actorId: user.id });
+    publish({ tenantId: user.tenant_id, permission: "workspace.users.manage" }, "password_reset.requested", { requestId });
+  }
+
+  await recordTenantAudit(db, asSelf(user), "user.password_reset_request", user.name, { ip, isTenantAdmin });
 }
 
 /** The issued, unexpired link for a token, with its person and workspace, or a 404. */

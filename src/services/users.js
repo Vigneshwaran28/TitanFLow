@@ -4,6 +4,7 @@ import bcrypt from "bcryptjs";
 import { insertAndGetId } from "../db/connection.js";
 import { HttpError, nowIso } from "../utils/http.js";
 import { assertSeatAvailable } from "./tenants.js";
+import { syncUserAccessCode } from "./tenantAccessCodes.js";
 
 /** Built-in role keys accepted wherever a single legacy `role` is given. */
 export const ROLES = Object.freeze(["admin", "agent", "member"]);
@@ -64,7 +65,7 @@ export async function generateUniqueUserLoginCode(db) {
  * @param {{ tenantId: number, name: string, email: string, password: string, role?: string, roleIds?: number[], jobTitle?: string | null, dateOfBirth?: string | null, joinedOn?: string | null, mustChangePassword?: boolean, loginCode?: string | null }} input
  * @returns {Promise<number>} the new user's id
  */
-export async function createUser(db, { tenantId, name, email, password, role, roleIds, jobTitle = null, dateOfBirth = null, joinedOn = null, mustChangePassword = true, loginCode = null }) {
+export async function createUser(db, { tenantId, name, email, password, role, roleIds, jobTitle = null, dateOfBirth = null, joinedOn = null, mustChangePassword = true, loginCode = null, isCodeLoginEnabled = true }) {
   const normalized = email.trim().toLowerCase();
   if (await db("users").where("tenant_id", tenantId).whereRaw("lower(email) = ?", [normalized]).first()) {
     throw new HttpError(422, "Please fix the highlighted fields.", { errors: { email: "Someone in this workspace already uses this email." } });
@@ -84,11 +85,23 @@ export async function createUser(db, { tenantId, name, email, password, role, ro
     date_of_birth: dateOfBirth || null,
     joined_on: joinedOn || null,
     is_active: true,
+    is_code_login_enabled: isCodeLoginEnabled,
     must_change_password: mustChangePassword,
     login_code: resolvedLoginCode,
     created_at: createdAt,
   });
   await db("user_roles").insert(ids.map(roleId => ({ user_id: id, role_id: roleId })));
   await db("lists").insert({ user_id: id, name: "Personal", color: "indigo", created_at: createdAt });
+
+  // Sync to common index table (tenant_access_codes)
+  try {
+    const tenant = await db("tenants").where({ id: tenantId }).first();
+    if (tenant) {
+      await syncUserAccessCode(tenant, { id, name, login_code: resolvedLoginCode }, { isActive: isCodeLoginEnabled });
+    }
+  } catch (err) {
+    console.error("[createUser] syncUserAccessCode notice:", err.message);
+  }
+
   return id;
 }

@@ -14,6 +14,7 @@ import { recordTenantAudit } from "../services/tenantAudit.js";
 import { assertSeatAvailable } from "../services/tenants.js";
 import { ageOf, dateOfBirthSchema, joinedOnSchema } from "../services/personDates.js";
 import { createUser, generateUniqueUserLoginCode, resolveRoleIds, ROLES } from "../services/users.js";
+import { syncUserAccessCode } from "../services/tenantAccessCodes.js";
 import { HttpError, nowIso, parseId, validate } from "../utils/http.js";
 
 const router = Router();
@@ -41,6 +42,7 @@ const updateSchema = z
     dateOfBirth: dateOfBirthSchema.nullable(),
     joinedOn: joinedOnSchema.nullable(),
     isActive: z.boolean(),
+    isCodeLoginEnabled: z.boolean(),
   })
   .partial();
 
@@ -58,6 +60,7 @@ const toManagedUser = (row, roles) => ({
   age: ageOf(row.date_of_birth),
   joinedOn: row.joined_on ?? null,
   isActive: Boolean(row.is_active),
+  isCodeLoginEnabled: row.is_code_login_enabled !== false,
   mustChangePassword: Boolean(row.must_change_password),
   lastLoginAt: row.last_login_at ?? null,
   loginCode: row.login_code ?? null,
@@ -170,6 +173,7 @@ router.patch("/:id", async (req, res) => {
   if (input.dateOfBirth !== undefined) changes.date_of_birth = input.dateOfBirth || null;
   if (input.joinedOn !== undefined) changes.joined_on = input.joinedOn || null;
   if (input.isActive !== undefined) changes.is_active = input.isActive;
+  if (input.isCodeLoginEnabled !== undefined) changes.is_code_login_enabled = input.isCodeLoginEnabled;
 
   await db.transaction(async trx => {
     if (Object.keys(changes).length) await trx("users").where({ id }).update(changes);
@@ -178,6 +182,15 @@ router.patch("/:id", async (req, res) => {
       await trx("user_roles").insert(nextRoleIds.map(roleId => ({ user_id: id, role_id: roleId })));
     }
   });
+
+  if (input.isCodeLoginEnabled !== undefined) {
+    try {
+      await syncUserAccessCode(req.tenant, { id, name: user.name, login_code: user.login_code }, { isActive: input.isCodeLoginEnabled });
+      await recordTenantAudit(db, req, input.isCodeLoginEnabled ? "user.enable_code_login" : "user.disable_code_login", user.name);
+    } catch (e) {
+      console.error("[user.patch] syncUserAccessCode error:", e.message);
+    }
+  }
 
   // Live sockets carry the old access: close them so the person's tabs re-check the session (signed out when
   // deactivated; reconnected with the new permissions after a role change).
@@ -238,6 +251,11 @@ router.post("/:id/login-code/regenerate", async (req, res) => {
 
   const newCode = await generateUniqueUserLoginCode(db);
   await db("users").where({ id, tenant_id: tenantId }).update({ login_code: newCode });
+  try {
+    await syncUserAccessCode(req.tenant, { id, name: user.name, login_code: newCode }, { isActive: user.is_code_login_enabled !== false, newCode });
+  } catch (e) {
+    console.error("[user.regenerate_login_code] syncUserAccessCode error:", e.message);
+  }
   await recordTenantAudit(db, req, "user.regenerate_login_code", user.name, { code: newCode });
 
   res.json({ ok: true, id, loginCode: newCode });
@@ -341,6 +359,7 @@ const resetRequestsQuery = (db, tenantId) =>
     .leftJoin("users as ib", "ib.id", "pr.issued_by")
     .where("pr.tenant_id", tenantId)
     .where("u.tenant_id", tenantId)
+    .where(builder => builder.where("pr.is_tenant_admin", false).orWhereNull("pr.is_tenant_admin"))
     .select("pr.*", "u.name as user_name", "u.email as user_email", "u.job_title as user_job_title", "ib.name as issued_by_name");
 
 router.get("/password-requests", async (req, res) => {

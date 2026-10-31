@@ -139,6 +139,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
     sessionHours: 168, // a sign-in lasts this long (7 days), then people sign in again
     allowedEmailDomains: [], // new and imported accounts must use one of these (empty = any domain)
     disabledModules: [], // licensed modules the workspace switched off for everyone (re-enable any time)
+    maxActiveSessions: null, // max concurrent sessions per user (null = unlimited)
+    allowCodeLogin: true, // overall workspace switch for logging in via security PIN / login code
   },
 });
 
@@ -331,6 +333,8 @@ export const settingsSchema = z
           .transform(list => [...new Set(list)]),
         // Checked against the licence in routes/workspace.js (the schema doesn't know the tenant).
         disabledModules: z.array(z.string().regex(/^[a-z]+$/)).max(20).transform(list => [...new Set(list)]),
+        maxActiveSessions: z.number().int().min(1, "At least 1 active session.").max(20, "At most 20 active sessions.").nullable().optional(),
+        allowCodeLogin: z.boolean().optional(),
       })
       .partial(),
     help: z
