@@ -77,7 +77,7 @@ export const globalRateLimiter = createRateLimiter({
 /** Auth rate limiter: 20 req/min per IP for sensitive sign-in/reset routes */
 export const authRateLimiter = createRateLimiter({
   windowMs: 60 * 1000,
-  max: 20,
+  max: process.env.NODE_ENV === "production" ? 20 : 300,
   message: "Too many authentication attempts. Please wait a minute before trying again.",
   code: "RATE_LIMIT_AUTH",
 });
