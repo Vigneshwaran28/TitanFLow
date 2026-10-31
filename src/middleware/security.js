@@ -25,6 +25,12 @@ export function securityHeaders(req, res, next) {
   // Cross-Origin policies
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
 
+  // Content Security Policy
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data: https:; connect-src 'self' ws: wss: https:; frame-ancestors 'self';"
+  );
+
   // Enforce HSTS when running on HTTPS or behind an SSL-terminating reverse proxy
   const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
   if (isHttps || process.env.NODE_ENV === "production") {
@@ -49,13 +55,27 @@ function isAllowedOrigin(origin, host) {
 
   try {
     const originUrl = new URL(origin);
-    const hostName = (host || "").split(":")[0];
 
-    // Localhost or same hostname on any port in dev
-    if (originUrl.hostname === "localhost" || originUrl.hostname === "127.0.0.1") {
-      return true;
+    // Localhost or loopback origins permitted only in non-production environments
+    if (process.env.NODE_ENV !== "production") {
+      if (originUrl.hostname === "localhost" || originUrl.hostname === "127.0.0.1" || originUrl.hostname === "::1") {
+        return true;
+      }
     }
-    if (hostName && originUrl.hostname === hostName) {
+
+    const trustedHosts = (process.env.TRUSTED_HOSTS || process.env.TASKFLOW_TRUSTED_HOSTS || "")
+      .split(",")
+      .map(h => h.trim().toLowerCase())
+      .filter(Boolean);
+
+    if (trustedHosts.length > 0) {
+      return trustedHosts.includes(originUrl.hostname.toLowerCase());
+    }
+
+    const configuredHost = (process.env.APP_URL || process.env.PUBLIC_URL || process.env.TASKFLOW_URL)
+      ? new URL(process.env.APP_URL || process.env.PUBLIC_URL || process.env.TASKFLOW_URL).hostname
+      : null;
+    if (configuredHost && originUrl.hostname.toLowerCase() === configuredHost.toLowerCase()) {
       return true;
     }
   } catch {

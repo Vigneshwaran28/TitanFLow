@@ -133,7 +133,11 @@ function readImport(csv) {
 }
 
 const csvCell = value => {
-  const text = value == null ? "" : String(value);
+  if (value === null || value === undefined) return "";
+  let text = String(value);
+  if (/^[=+\-@\t\r]/.test(text) && !/^-?\d+(\.\d+)?$/.test(text)) {
+    text = `'${text}`;
+  }
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 };
 

@@ -50,6 +50,8 @@ export function buildKnexConfig(config, { databaseOverride, pool } = {}) {
     };
   }
 
+  const defaultSslReject = process.env.NODE_ENV === "production" && process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false";
+
   if (config.client === "mysql" || config.client === "mariadb") {
     return {
       client: "mysql2",
@@ -60,7 +62,7 @@ export function buildKnexConfig(config, { databaseOverride, pool } = {}) {
         database: databaseOverride === null ? undefined : (databaseOverride ?? config.database),
         user: config.user,
         password: config.password,
-        ssl: config.ssl ? { rejectUnauthorized: false } : undefined,
+        ssl: config.ssl ? { rejectUnauthorized: defaultSslReject } : undefined,
         connectTimeout: 8000,
         charset: "utf8mb4",
         // Sums and averages come back as numbers, like on the other databases.
@@ -73,11 +75,12 @@ export function buildKnexConfig(config, { databaseOverride, pool } = {}) {
 
   const connectionString = config.connectionString || (config.client === "postgres" ? process.env.DATABASE_URL : null);
   if (connectionString) {
+    const isSslDisabled = connectionString.includes("sslmode=disable");
     return {
       client: "pg",
       connection: {
         connectionString,
-        ssl: { rejectUnauthorized: false },
+        ssl: isSslDisabled ? false : { rejectUnauthorized: defaultSslReject },
         connectionTimeoutMillis: 10000,
       },
       pool: pool ?? { min: 0, max: 10 },
@@ -92,7 +95,7 @@ export function buildKnexConfig(config, { databaseOverride, pool } = {}) {
       database: databaseOverride ?? config.database,
       user: config.user,
       password: config.password,
-      ssl: config.ssl ? { rejectUnauthorized: false } : false,
+      ssl: config.ssl ? { rejectUnauthorized: defaultSslReject } : false,
       connectionTimeoutMillis: 8000,
     },
     pool: pool ?? { min: 0, max: 10 },

@@ -93,7 +93,7 @@ async function assertUniqueSku(db, tenantId, sku, exceptId) {
  * @returns {Promise<number>} the new balance
  */
 export async function moveStock(trx, { tenantId, productId, change, type, reason = null, reference = null, userId = null }) {
-  const product = await trx("products").where({ id: productId, tenant_id: tenantId }).first();
+  const product = await trx("products").where({ id: productId, tenant_id: tenantId }).forUpdate().first();
   if (!product) throw new HttpError(404, "Product not found.");
   const balance = Number(product.quantity) + change;
   if (balance < 0) {
@@ -244,7 +244,7 @@ router.patch("/products/:id", requirePermission("inventory.products.edit"), asyn
       .filter(([key]) => sent.has(key) && map[key])
       .map(([key, value]) => [map[key], value === "" ? null : value])
   );
-  if (Object.keys(changes).length) await db("products").where({ id }).update({ ...changes, updated_at: nowIso() });
+  if (Object.keys(changes).length) await db("products").where({ id, tenant_id: tenantId }).update({ ...changes, updated_at: nowIso() });
   res.json(toProduct(await findProduct(db, tenantId, id)));
 });
 
@@ -252,7 +252,7 @@ router.delete("/products/:id", requirePermission("inventory.products.delete"), a
   const id = parseId(req.params.id);
   const db = getDb();
   await findProduct(db, req.user.tenant_id, id);
-  await db("products").where({ id }).delete();
+  await db("products").where({ id, tenant_id: req.user.tenant_id }).delete();
   res.status(204).end();
 });
 

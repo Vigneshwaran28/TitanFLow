@@ -16,7 +16,7 @@ import {
   tenantFromRow,
   workspaceSessions,
 } from "../middleware/auth.js";
-import { assertPasswordAllowed } from "../services/securityPolicy.js";
+import { assertEmailAllowed, assertPasswordAllowed } from "../services/securityPolicy.js";
 import { bypassesMaintenance, maintenanceError, workspaceMaintenance } from "../services/maintenance.js";
 import { ACCENTS, imageUrlSchema, normalizeCss, resolveSettings, STYLES, TOUR_KEYS, userCssProblem } from "../services/moduleSettings.js";
 import { avatarUrlOf } from "../services/avatars.js";
@@ -24,6 +24,7 @@ import { notifyUsers } from "../services/notify.js";
 import { closeOpenResets, expireStaleLinks, hashResetToken, maskEmail, OPEN_STATUSES, TOKEN_PATTERN } from "../services/passwordResets.js";
 import { parsePermissions, rolesByUser, usersWithPermission } from "../services/permissions.js";
 import { createUser, findAccountIdsByEmail } from "../services/users.js";
+import { assertSeatAvailable } from "../services/tenants.js";
 import { findTenantByAccessCode, recordAccessCodeUsage } from "../services/tenantAccessCodes.js";
 import { forEachDatabase, runInTenant, runInWorkspace } from "../services/tenantDatabases.js";
 import jwt from "jsonwebtoken";
@@ -93,11 +94,14 @@ const preferencesSchema = z
     sidebarPosition: z.enum(["left", "right"]),
     sidebarMode: z.enum(["full", "compact"]),
     sidebarAlign: z.enum(["left", "center"]),
-    navbarStyle: z.enum(["glass", "solid", "tinted", "floating"]).optional(),
+    navbarStyle: z.enum(["glass", "solid", "tinted", "floating", "dock"]).optional(),
     navbarSticky: z.boolean().optional(),
+    floatingDock: z.enum(["always", "mobile", "off"]).or(z.boolean()).optional(),
+    layoutWidth: z.enum(["standard", "wide", "full"]).optional(),
+    cardRadius: z.enum(["default", "sharp", "rounded", "pill"]).optional(),
     showQuickMeet: z.boolean().optional(),
     showSoundToggle: z.boolean().optional(),
-    iconLibrary: z.enum(["lucide", "tabler", "material", "heroicons", "phosphor", "remix"]),
+    iconLibrary: z.enum(["lucide", "tabler", "heroicons", "phosphor"]).or(z.enum(["material", "remix"]).transform(() => "lucide")),
     iconStyle: z.enum(["outline", "filled", "bold", "rounded"]),
     iconStrokeWidth: z.number().min(1).max(3),
     customIcons: z.record(z.string().max(100)).nullable(),
@@ -187,9 +191,12 @@ const verifyCodeSchema = z.object({
 });
 
 router.post("/verify-code", async (req, res) => {
+  const ipKey = `${req.ip ?? "unknown"}|code_attempts`;
+  checkLock(ipKey);
   const input = validate(verifyCodeSchema, req.body);
   const result = await findTenantByAccessCode(input.code);
   if (!result || !result.valid) {
+    recordFailure(ipKey);
     const message = result?.message || "Invalid or expired security code / PIN.";
     throw new HttpError(404, message, { code: result?.problem || "INVALID_ACCESS_CODE" });
   }
@@ -213,9 +220,15 @@ const codeLoginSchema = z.object({
 });
 
 router.post("/code-login", async (req, res) => {
+  const ipKey = `${req.ip ?? "unknown"}|code_attempts`;
+  checkLock(ipKey);
   const input = validate(codeLoginSchema, req.body);
+  const codeKey = `${req.ip ?? "unknown"}|code:${input.code}`;
+  checkLock(codeKey);
   const result = await findTenantByAccessCode(input.code);
   if (!result || !result.valid) {
+    recordFailure(ipKey);
+    recordFailure(codeKey);
     throw new HttpError(401, result?.message || "Invalid or expired security code / PIN.", { code: result?.problem || "INVALID_ACCESS_CODE" });
   }
 
@@ -232,11 +245,22 @@ router.post("/code-login", async (req, res) => {
     if (userRow.is_code_login_enabled === false) {
       throw new HttpError(403, "Login with access code is disabled for this account.", { code: "USER_CODE_DISABLED" });
     }
-    if (input.password && !(await bcrypt.compare(input.password, userRow.password_hash))) {
-      throw new HttpError(401, "Incorrect password.", { code: "INVALID_CREDENTIALS" });
+    if (userRow.password_hash) {
+      if (!input.password) {
+        throw new HttpError(400, "Password is required to sign in with this access code.", { code: "PASSWORD_REQUIRED" });
+      }
+      const isPasswordValid = await bcrypt.compare(input.password, userRow.password_hash);
+      if (!isPasswordValid) {
+        recordFailure(ipKey);
+        recordFailure(codeKey);
+        throw new HttpError(401, "Incorrect password.", { code: "INVALID_CREDENTIALS" });
+      }
     }
     const problem = accessProblem(userRow);
     if (problem) throw new HttpError(problem.status, problem.message, { code: problem.code });
+
+    failures.delete(ipKey);
+    failures.delete(codeKey);
 
     if (result.code.id) {
       await recordAccessCodeUsage(result.code.id);
@@ -250,14 +274,25 @@ router.post("/code-login", async (req, res) => {
   if (targetEmail) {
     const candidates = await accountsByEmail(targetEmail, tenantSlug);
     if (!candidates.length) {
+      recordFailure(ipKey);
+      recordFailure(codeKey);
       throw new HttpError(404, "No account found with this email in this workspace. You can create an account using this PIN.", { code: "ACCOUNT_NOT_FOUND" });
     }
     const match = candidates[0];
-    if (input.password && !(await bcrypt.compare(input.password, match.password_hash))) {
+    if (!input.password) {
+      throw new HttpError(400, "Password is required to sign in with this access code.", { code: "PASSWORD_REQUIRED" });
+    }
+    const isPasswordValid = await bcrypt.compare(input.password, match.password_hash);
+    if (!isPasswordValid) {
+      recordFailure(ipKey);
+      recordFailure(codeKey);
       throw new HttpError(401, "Incorrect password.", { code: "INVALID_CREDENTIALS" });
     }
     const problem = accessProblem(match);
     if (problem) throw new HttpError(problem.status, problem.message, { code: problem.code });
+
+    failures.delete(ipKey);
+    failures.delete(codeKey);
 
     if (result.code.id) {
       await recordAccessCodeUsage(result.code.id);
@@ -301,9 +336,11 @@ router.post("/register-with-code", async (req, res) => {
     if (!tenant) throw new HttpError(404, "Workspace not found.");
     if (tenant.status !== "active") throw new HttpError(403, "This workspace is currently suspended.", { code: "TENANT_SUSPENDED" });
 
-    // Validate security policy for password
+    // Validate security policy for email & password, and check available seats
     const settings = resolveSettings(tenant.settings);
-    assertPasswordAllowed(input.password, settings.security);
+    assertEmailAllowed(settings.security, input.email);
+    assertPasswordAllowed(settings.security, input.password);
+    await assertSeatAvailable(db, tenantId);
 
     // Create user in this tenant workspace
     const userId = await createUser(db, {

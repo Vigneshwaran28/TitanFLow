@@ -50,22 +50,30 @@ const passwordSchema = z.object({ password: z.string().min(8, "Use at least 8 ch
 
 const forbidden = message => new HttpError(403, message, { code: "FORBIDDEN" });
 
-const toManagedUser = (row, roles) => ({
-  id: row.id,
-  name: row.name,
-  email: row.email,
-  roles: roles ?? [],
-  jobTitle: row.job_title ?? null,
-  dateOfBirth: row.date_of_birth ?? null,
-  age: ageOf(row.date_of_birth),
-  joinedOn: row.joined_on ?? null,
-  isActive: Boolean(row.is_active),
-  isCodeLoginEnabled: row.is_code_login_enabled !== false,
-  mustChangePassword: Boolean(row.must_change_password),
-  lastLoginAt: row.last_login_at ?? null,
-  loginCode: row.login_code ?? null,
-  createdAt: row.created_at,
-});
+const toManagedUser = (row, roles, viewer = null) => {
+  const isSelf = viewer && viewer.id === row.id;
+  const isOwnerViewer = viewer && Boolean(viewer.isOwner);
+  const targetIsOwner = Boolean(roles?.some(r => r.key === "owner"));
+  // Subordinates cannot see owner codes; non-owners can only see their own code; owners can see non-owner subordinate codes and their own code
+  const canSeeCode = isSelf || (isOwnerViewer && !targetIsOwner);
+
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    roles: roles ?? [],
+    jobTitle: row.job_title ?? null,
+    dateOfBirth: row.date_of_birth ?? null,
+    age: ageOf(row.date_of_birth),
+    joinedOn: row.joined_on ?? null,
+    isActive: Boolean(row.is_active),
+    isCodeLoginEnabled: row.is_code_login_enabled !== false,
+    mustChangePassword: Boolean(row.must_change_password),
+    lastLoginAt: row.last_login_at ?? null,
+    loginCode: canSeeCode ? (row.login_code ?? null) : null,
+    createdAt: row.created_at,
+  };
+};
 
 async function findMember(db, tenantId, id) {
   const user = await db("users").where({ id, tenant_id: tenantId }).first();
@@ -124,7 +132,7 @@ router.get("/", async (req, res) => {
   }
 
   res.json({
-    users: users.map(user => toManagedUser(user, roles.get(user.id))),
+    users: users.map(user => toManagedUser(user, roles.get(user.id), { id: req.user.id, isOwner: req.access.isOwner })),
     seats: { used: users.filter(user => user.is_active).length, limit: tenant?.max_users ?? null },
   });
 });
@@ -141,7 +149,7 @@ router.post("/", async (req, res) => {
   const id = await createUser(db, { tenantId, ...input, roleIds });
   const roles = await loadRoles(db, tenantId, id);
   await recordTenantAudit(db, req, "user.create", input.name, { email: input.email.toLowerCase(), roles: roles.map(role => role.name).join(", ") });
-  res.status(201).json(toManagedUser(await db("users").where({ id }).first(), roles));
+  res.status(201).json(toManagedUser(await db("users").where({ id }).first(), roles, { id: req.user.id, isOwner: req.access.isOwner }));
 });
 
 router.patch("/:id", async (req, res) => {
@@ -200,7 +208,7 @@ router.patch("/:id", async (req, res) => {
   if (nextRoleIds) await recordTenantAudit(db, req, "user.roles", user.name, { from: currentRoles.map(role => role.name).join(", "), to: roles.map(role => role.name).join(", ") });
   if (input.isActive !== undefined && input.isActive !== Boolean(user.is_active)) await recordTenantAudit(db, req, input.isActive ? "user.activate" : "user.deactivate", user.name);
   if (input.name !== undefined && input.name !== user.name) await recordTenantAudit(db, req, "user.rename", user.name, { to: input.name });
-  res.json(toManagedUser(await db("users").where({ id }).first(), roles));
+  res.json(toManagedUser(await db("users").where({ id }).first(), roles, { id: req.user.id, isOwner: req.access.isOwner }));
 });
 
 router.post("/:id/password", async (req, res) => {
@@ -243,11 +251,10 @@ router.post("/:id/login-code/regenerate", async (req, res) => {
   const tenantId = req.user.tenant_id;
   const user = await findMember(db, tenantId, id);
 
-  const currentRoles = await loadRoles(db, tenantId, id);
-  const isOwner = currentRoles.some(role => role.key === "owner");
-  if (isOwner && !req.access.isOwner) {
-    throw forbidden("Only an owner can regenerate another owner's login code.");
+  if (!req.access.isOwner && id !== req.user.id) {
+    throw forbidden("Only an owner can regenerate another user's login code.");
   }
+  await assertCanResetPassword(db, req, tenantId, id);
 
   const newCode = await generateUniqueUserLoginCode(db);
   await db("users").where({ id, tenant_id: tenantId }).update({ login_code: newCode });
@@ -347,10 +354,25 @@ const toResetRequest = row => ({
   issuedBy: personRef(row.issued_by, row.issued_by_name),
 });
 
-/** Same rule as setting a temporary password: only an owner can reset another owner. */
+/** Anti-escalation: only an owner can reset another owner; non-owners cannot reset admins or users with higher privileges. */
 async function assertCanResetPassword(db, req, tenantId, userId) {
+  if (userId === req.user.id) return;
+  if (req.access.isOwner) return;
   const roles = await loadRoles(db, tenantId, userId);
-  if (roles.some(role => role.key === "owner") && !req.access.isOwner) throw forbidden("Only an owner can reset another owner's password.");
+  if (roles.some(role => role.key === "owner")) {
+    throw forbidden("Only an owner can reset another owner's password.");
+  }
+  const isTargetAdmin = roles.some(role => role.key === "admin");
+  const isCallerAdmin = Boolean(req.access.roles?.some(r => (typeof r === "string" ? r === "admin" : r.key === "admin")));
+  if (isTargetAdmin && !isCallerAdmin) {
+    throw forbidden("Only an administrator or owner can reset an administrator's password.");
+  }
+  for (const role of roles) {
+    const missing = parsePermissions(role.permissions).filter(key => isLicensed(key, req.tenant.features) && !req.access.permissions.includes(key));
+    if (missing.length) {
+      throw forbidden(`You cannot reset the password for this user because they hold permissions you do not have.`);
+    }
+  }
 }
 
 const resetRequestsQuery = (db, tenantId) =>

@@ -324,7 +324,10 @@ function consoleAuditFor(query, tenantId) {
 function toCsv(columns, rows) {
   const cell = value => {
     if (value === null || value === undefined) return "";
-    const text = String(value);
+    let text = String(value);
+    if (/^[=+\-@\t\r]/.test(text) && !/^-?\d+(\.\d+)?$/.test(text)) {
+      text = `'${text}`;
+    }
     return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   };
   return [columns.join(","), ...rows.map(row => columns.map(column => cell(row[column])).join(","))].join("\r\n");

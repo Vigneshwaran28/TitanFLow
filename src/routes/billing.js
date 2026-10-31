@@ -620,13 +620,17 @@ router.post("/documents/:id/payments", requirePermission("billing.payments.recor
   // A day of slack covers time zones ahead of UTC.
   if (input.paidOn > addDays(todayIso(), 1)) throw invalid("paidOn", "The payment date can't be in the future.");
 
-  const doc = await findDocument(db, tenantId, id);
-  assertKind(doc, "invoice", "paid");
-  assertStatus(doc, OPEN_STATUSES, "paid");
-  const balance = round2(Number(doc.total) - Number(doc.amount_paid));
-  if (input.amount > balance) throw invalid("amount", `Only ${balance.toFixed(2)} is outstanding on this invoice.`);
+  const { doc, state } = await db.transaction(async trx => {
+    const lockedDoc = await trx("invoices").where({ id, tenant_id: tenantId }).forUpdate().first();
+    if (!lockedDoc) throw new HttpError(404, "Invoice or quote not found.");
+    assertKind(lockedDoc, "invoice", "paid");
+    assertStatus(lockedDoc, OPEN_STATUSES, "paid");
 
-  const state = await db.transaction(async trx => {
+    const currentPaid = Number(lockedDoc.amount_paid ?? 0);
+    const docTotal = Number(lockedDoc.total ?? 0);
+    const balance = round2(docTotal - currentPaid);
+    if (input.amount > balance) throw invalid("amount", `Only ${balance.toFixed(2)} is outstanding on this invoice.`);
+
     await trx("invoice_payments").insert({
       tenant_id: tenantId,
       invoice_id: id,
@@ -638,13 +642,13 @@ router.post("/documents/:id/payments", requirePermission("billing.payments.recor
       recorded_by: req.user.id,
       created_at: nowIso(),
     });
-    const amountPaid = round2(Number(doc.amount_paid) + input.amount);
-    const next = paymentState(Number(doc.total), amountPaid);
+    const amountPaid = round2(currentPaid + input.amount);
+    const next = paymentState(docTotal, amountPaid);
     await trx("invoices").where({ id }).update({ ...next, amount_paid: amountPaid, updated_at: nowIso() });
     if (next.status === "paid") {
-      await notifyUsers(trx, [doc.created_by], { title: `Invoice ${doc.number} paid in full`, body: `${doc.bill_to_name} paid ${Number(doc.total).toFixed(2)} ${doc.currency}`, actorId: req.user.id });
+      await notifyUsers(trx, [lockedDoc.created_by], { title: `Invoice ${lockedDoc.number} paid in full`, body: `${lockedDoc.bill_to_name} paid ${docTotal.toFixed(2)} ${lockedDoc.currency}`, actorId: req.user.id });
     }
-    return next;
+    return { doc: lockedDoc, state: next };
   });
   await recordTenantAudit(db, req, "invoice.payment", doc.number, { amount: input.amount, method: input.method, paidOn: input.paidOn, status: state.status });
   res.status(201).json(await loadDocument(db, req, id));
@@ -712,7 +716,11 @@ router.get("/products", async (req, res) => {
 
 // ---- Export ----
 const csvCell = value => {
-  const text = value == null ? "" : String(value);
+  if (value === null || value === undefined) return "";
+  let text = String(value);
+  if (/^[=+\-@\t\r]/.test(text) && !/^-?\d+(\.\d+)?$/.test(text)) {
+    text = `'${text}`;
+  }
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 };
 

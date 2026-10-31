@@ -52,6 +52,7 @@ const createSchema = z.object({
   endAt: z.string().datetime({ offset: true }).optional().nullable(),
   reminderMinutes: z.coerce.number().int().min(1).max(120).default(5),
   participantIds: z.array(z.number().int().positive()).optional().default([]),
+  roleIds: z.array(z.number().int().positive()).optional().default([]),
   isInstant: z.boolean().optional().default(false),
 });
 
@@ -65,6 +66,7 @@ const updateSchema = z
     endAt: z.string().datetime({ offset: true }).nullable(),
     reminderMinutes: z.coerce.number().int().min(1).max(120),
     participantIds: z.array(z.number().int().positive()),
+    roleIds: z.array(z.number().int().positive()),
   })
   .partial();
 
@@ -75,8 +77,8 @@ const querySchema = z.object({
 
 function canManageMeeting(req, meeting) {
   if (meeting.created_by === req.user.id) return true;
-  if (req.user.isOwner) return true;
-  return Boolean(req.user.permissions?.includes("workspace.users.manage"));
+  if (req.access?.isOwner) return true;
+  return Boolean(req.access?.permissions?.includes("workspace.users.manage"));
 }
 
 router.get("/", async (req, res) => {
@@ -141,10 +143,28 @@ router.get("/", async (req, res) => {
     }
   }
 
+  const [tenantRoles, myUserRoles] = await Promise.all([
+    db("roles").where("tenant_id", tenantId).select("id", "key", "name"),
+    db("user_roles").where("user_id", req.user.id).pluck("role_id"),
+  ]);
+  const rolesById = new Map(tenantRoles.map(r => [r.id, r]));
+  const myRoleIds = new Set(myUserRoles);
+
   const items = rows.map(row => {
     const participants = participantsByMeeting.get(row.id) ?? [];
-    // User is included if meeting is workspace-wide (empty participants) or user is in participant list or is creator
-    const isParticipant = participants.length === 0 || participants.some(p => p.id === req.user.id) || row.created_by === req.user.id;
+    let roleIds = [];
+    try {
+      roleIds = row.role_ids ? JSON.parse(row.role_ids) : [];
+    } catch {}
+    const assignedRoles = roleIds.map(rid => rolesById.get(rid)).filter(Boolean);
+    const hasAssignedRole = roleIds.some(rid => myRoleIds.has(rid));
+
+    // User is included if meeting is workspace-wide (empty participants) or user is in participant list or is creator or holds an assigned role
+    const isParticipant =
+      participants.length === 0 ||
+      participants.some(p => p.id === req.user.id) ||
+      row.created_by === req.user.id ||
+      hasAssignedRole;
 
     return {
       id: row.id,
@@ -167,6 +187,8 @@ router.get("/", async (req, res) => {
           }
         : null,
       participants,
+      roleIds,
+      roles: assignedRoles,
       isParticipant,
       canManage: canManageMeeting(req, row),
       createdAt: row.created_at,
@@ -175,6 +197,48 @@ router.get("/", async (req, res) => {
   });
 
   res.json({ items });
+});
+
+router.get("/assignable-options", async (req, res) => {
+  const db = getDb();
+  const tenantId = req.user.tenant_id;
+
+  const [users, roles, roleCounts] = await Promise.all([
+    db("users")
+      .where({ tenant_id: tenantId, is_active: true })
+      .orderBy("name")
+      .select("id", "name", "email", "job_title", "preferences"),
+    db("roles")
+      .where("tenant_id", tenantId)
+      .orderBy("is_system", "desc")
+      .orderBy("id")
+      .select("id", "key", "name", "description"),
+    db("user_roles as ur")
+      .join("users as u", "u.id", "ur.user_id")
+      .where({ "u.tenant_id": tenantId, "u.is_active": true })
+      .groupBy("ur.role_id")
+      .select("ur.role_id")
+      .count({ count: "*" }),
+  ]);
+
+  const countByRole = new Map(roleCounts.map(r => [r.role_id, Number(r.count)]));
+
+  res.json({
+    users: users.map(u => ({
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      jobTitle: u.job_title ?? null,
+      avatarUrl: avatarUrlOf(u, req),
+    })),
+    roles: roles.map(r => ({
+      id: r.id,
+      key: r.key ?? null,
+      name: r.name,
+      description: r.description ?? null,
+      memberCount: countByRole.get(r.id) ?? 0,
+    })),
+  });
 });
 
 router.get("/:id", async (req, res) => {
@@ -195,10 +259,28 @@ router.get("/:id", async (req, res) => {
 
   if (!row) throw new HttpError(404, "Meeting not found.");
 
-  const participants = await db("meeting_participants as mp")
-    .join("users as u", "u.id", "mp.user_id")
-    .where("mp.meeting_id", id)
-    .select("u.id", "u.name", "u.email", "u.preferences");
+  const [participants, tenantRoles, myUserRoles] = await Promise.all([
+    db("meeting_participants as mp")
+      .join("users as u", "u.id", "mp.user_id")
+      .where("mp.meeting_id", id)
+      .select("u.id", "u.name", "u.email", "u.preferences"),
+    db("roles").where("tenant_id", tenantId).select("id", "key", "name"),
+    db("user_roles").where("user_id", req.user.id).pluck("role_id"),
+  ]);
+
+  let roleIds = [];
+  try {
+    roleIds = row.role_ids ? JSON.parse(row.role_ids) : [];
+  } catch {}
+  const rolesById = new Map(tenantRoles.map(r => [r.id, r]));
+  const assignedRoles = roleIds.map(rid => rolesById.get(rid)).filter(Boolean);
+  const myRoleIds = new Set(myUserRoles);
+  const hasAssignedRole = roleIds.some(rid => myRoleIds.has(rid));
+  const isParticipant =
+    participants.length === 0 ||
+    participants.some(p => p.id === req.user.id) ||
+    row.created_by === req.user.id ||
+    hasAssignedRole;
 
   res.json({
     id: row.id,
@@ -226,6 +308,9 @@ router.get("/:id", async (req, res) => {
       email: p.email,
       avatarUrl: avatarUrlOf(p, req),
     })),
+    roleIds,
+    roles: assignedRoles,
+    isParticipant,
     canManage: canManageMeeting(req, row),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -238,8 +323,20 @@ router.post("/", async (req, res) => {
   const tenantId = req.user.tenant_id;
   const platform = input.platform || detectPlatform(input.url);
   const now = nowIso();
+  const roleIds = input.roleIds ?? [];
 
   const id = await db.transaction(async trx => {
+    let participantUserIds = [...(input.participantIds ?? [])];
+
+    if (roleIds.length > 0) {
+      const usersInRoles = await trx("user_roles as ur")
+        .join("users as u", "u.id", "ur.user_id")
+        .where({ "u.tenant_id": tenantId, "u.is_active": true })
+        .whereIn("ur.role_id", roleIds)
+        .pluck("u.id");
+      participantUserIds = Array.from(new Set([...participantUserIds, ...usersInRoles]));
+    }
+
     const meetingId = await insertAndGetId(trx, "meetings", {
       tenant_id: tenantId,
       created_by: req.user.id,
@@ -252,14 +349,15 @@ router.post("/", async (req, res) => {
       reminder_minutes: input.reminderMinutes,
       reminder_sent: false,
       is_instant: input.isInstant,
+      role_ids: roleIds.length > 0 ? JSON.stringify(roleIds) : null,
       created_at: now,
       updated_at: now,
     });
 
-    if (input.participantIds && input.participantIds.length > 0) {
+    if (participantUserIds.length > 0) {
       const validUsers = await trx("users")
         .where("tenant_id", tenantId)
-        .whereIn("id", input.participantIds)
+        .whereIn("id", participantUserIds)
         .select("id");
 
       const links = validUsers.map(u => ({
@@ -296,6 +394,9 @@ router.post("/", async (req, res) => {
     .select("m.*", "u.name as creator_name", "u.email as creator_email")
     .first();
 
+  const tenantRoles = await db("roles").where("tenant_id", tenantId).select("id", "key", "name");
+  const rolesById = new Map(tenantRoles.map(r => [r.id, r]));
+
   res.status(201).json({
     id: row.id,
     title: row.title,
@@ -310,6 +411,8 @@ router.post("/", async (req, res) => {
     isInstant: Boolean(row.is_instant),
     createdBy: { id: req.user.id, name: req.user.name },
     participants: [],
+    roleIds,
+    roles: roleIds.map(rid => rolesById.get(rid)).filter(Boolean),
     canManage: true,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -352,16 +455,39 @@ router.patch("/:id", async (req, res) => {
   if (input.reminderMinutes !== undefined) {
     changes.reminder_minutes = input.reminderMinutes;
   }
+  if (input.roleIds !== undefined) {
+    changes.role_ids = input.roleIds.length > 0 ? JSON.stringify(input.roleIds) : null;
+  }
 
   await db.transaction(async trx => {
     await trx("meetings").where({ id }).update(changes);
 
-    if (input.participantIds !== undefined) {
+    if (input.participantIds !== undefined || input.roleIds !== undefined) {
+      let roleIds = input.roleIds !== undefined
+        ? input.roleIds
+        : [];
+      if (input.roleIds === undefined && current.role_ids) {
+        try { roleIds = JSON.parse(current.role_ids); } catch {}
+      }
+
+      let participantUserIds = input.participantIds !== undefined
+        ? [...input.participantIds]
+        : (await trx("meeting_participants").where({ meeting_id: id }).pluck("user_id"));
+
+      if (roleIds.length > 0) {
+        const usersInRoles = await trx("user_roles as ur")
+          .join("users as u", "u.id", "ur.user_id")
+          .where({ "u.tenant_id": tenantId, "u.is_active": true })
+          .whereIn("ur.role_id", roleIds)
+          .pluck("u.id");
+        participantUserIds = Array.from(new Set([...participantUserIds, ...usersInRoles]));
+      }
+
       await trx("meeting_participants").where({ meeting_id: id }).delete();
-      if (input.participantIds.length > 0) {
+      if (participantUserIds.length > 0) {
         const validUsers = await trx("users")
           .where("tenant_id", tenantId)
-          .whereIn("id", input.participantIds)
+          .whereIn("id", participantUserIds)
           .select("id");
 
         const links = validUsers.map(u => ({

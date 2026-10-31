@@ -137,7 +137,7 @@ router.patch("/customers/:id", requirePermission("sales.edit"), async (req, res)
   const input = validate(customerSchema.partial(), req.body ?? {});
   if ("ownerId" in (req.body ?? {})) await assertOwner(db, tenantId, input.ownerId);
   const changes = sentOnly(input, req.body, { name: "name", company: "company", email: "email", phone: "phone", address: "address", notes: "notes", ownerId: "owner_id" });
-  if (Object.keys(changes).length) await db("customers").where({ id }).update({ ...changes, updated_at: nowIso() });
+  if (Object.keys(changes).length) await db("customers").where({ id, tenant_id: tenantId }).update({ ...changes, updated_at: nowIso() });
   res.json(toCustomer(await customersQuery(db, tenantId).where("c.id", id).first()));
 });
 
@@ -145,7 +145,7 @@ router.delete("/customers/:id", requirePermission("sales.delete"), async (req, r
   const id = parseId(req.params.id);
   const db = getDb();
   await assertCustomer(db, req.user.tenant_id, id);
-  await db("customers").where({ id }).delete(); // deals and orders keep their history without a customer
+  await db("customers").where({ id, tenant_id: req.user.tenant_id }).delete(); // deals and orders keep their history without a customer
   res.status(204).end();
 });
 
@@ -225,7 +225,7 @@ router.delete("/deals/:id", async (req, res) => {
   const deal = await db("deals").where({ id, tenant_id: req.user.tenant_id }).first();
   if (!deal) throw new HttpError(404, "Deal not found.");
   if (deal.owner_id !== req.user.id && !can(req, "sales.delete")) throw new HttpError(403, "Only the deal owner or someone allowed to delete sales records can delete it.", { code: "FORBIDDEN" });
-  await db("deals").where({ id }).delete();
+  await db("deals").where({ id, tenant_id: req.user.tenant_id }).delete();
   res.status(204).end();
 });
 
@@ -273,7 +273,7 @@ async function loadOrder(db, tenantId, id) {
 }
 
 /** Resolves line items against the tenant's products and prices them. */
-async function buildItems(db, tenantId, items) {
+async function buildItems(db, tenantId, items, req = null) {
   const ids = [...new Set(items.map(item => item.productId).filter(Boolean))];
   const products = ids.length ? await db("products").where("tenant_id", tenantId).whereIn("id", ids) : [];
   const byId = new Map(products.map(product => [product.id, product]));
@@ -282,7 +282,14 @@ async function buildItems(db, tenantId, items) {
     if (item.productId && !product) throw new HttpError(422, "Please fix the highlighted fields.", { errors: { items: `Line ${index + 1}: that product no longer exists.` } });
     const description = item.description || product?.name;
     if (!description) throw new HttpError(422, "Please fix the highlighted fields.", { errors: { items: `Line ${index + 1}: add a description or pick a product.` } });
-    const unitPrice = item.unitPrice ?? Number(product?.sale_price ?? 0);
+    let unitPrice = Number(product?.sale_price ?? 0);
+    if (item.unitPrice !== undefined) {
+      const canOverridePrice = req ? (req.access?.isOwner || req.access?.permissions?.includes("billing.invoices.manage")) : true;
+      if (!canOverridePrice && product && item.unitPrice !== Number(product.sale_price)) {
+        throw new HttpError(403, `Line ${index + 1}: you don't have permission to override catalog prices.`, { code: "PRICE_OVERRIDE_FORBIDDEN" });
+      }
+      unitPrice = item.unitPrice;
+    }
     return { product_id: product?.id ?? null, description, quantity: item.quantity, unit_price: unitPrice, line_total: round2(unitPrice * item.quantity) };
   });
 }
@@ -328,7 +335,7 @@ router.post("/orders", requirePermission("sales.edit"), async (req, res) => {
   const db = getDb();
   const tenantId = req.user.tenant_id;
   await assertCustomer(db, tenantId, input.customerId);
-  const items = await buildItems(db, tenantId, input.items);
+  const items = await buildItems(db, tenantId, input.items, req);
   const now = nowIso();
 
   const id = await db.transaction(async trx => {
@@ -380,7 +387,7 @@ router.patch("/orders/:id", async (req, res) => {
     }
     if ("notes" in body) changes.notes = input.notes || null;
     if ("items" in body) {
-      items = await buildItems(trx, tenantId, input.items);
+      items = await buildItems(trx, tenantId, input.items, req);
       await trx("order_items").where({ order_id: id }).delete();
       await trx("order_items").insert(items.map(item => ({ ...item, order_id: id })));
       changes.total = round2(items.reduce((sum, item) => sum + Number(item.line_total), 0));
@@ -397,7 +404,7 @@ router.patch("/orders/:id", async (req, res) => {
         if (current.status === "confirmed") await applyStock(trx, req, items, +1, id);
       }
     }
-    await trx("orders").where({ id }).update(changes);
+    await trx("orders").where({ id, tenant_id: tenantId }).update(changes);
   });
 
   const { row, items } = await loadOrder(db, tenantId, id);
@@ -409,7 +416,7 @@ router.delete("/orders/:id", requirePermission("sales.edit"), async (req, res) =
   const db = getDb();
   const { row } = await loadOrder(db, req.user.tenant_id, id);
   if (row.status !== "draft") throw new HttpError(422, "Only draft orders can be deleted. Cancel it instead.", { code: "ORDER_LOCKED" });
-  await db("orders").where({ id }).delete();
+  await db("orders").where({ id, tenant_id: req.user.tenant_id }).delete();
   res.status(204).end();
 });
 

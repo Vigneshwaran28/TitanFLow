@@ -49,11 +49,30 @@ function parseCookies(header = "") {
 function originAllowed(req) {
   const origin = req.headers.origin;
   if (!origin) return true; // non-browser clients send no Origin; they have no ambient cookie either
-  const allowed = (process.env.ALLOWED_ORIGINS ?? "").split(",").map(value => value.trim()).filter(Boolean);
+  const allowed = (process.env.ALLOWED_ORIGINS || process.env.TASKFLOW_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map(value => value.trim())
+    .filter(Boolean);
   if (allowed.includes(origin)) return true;
   try {
-    const host = (req.headers.host ?? "").split(":")[0];
-    return new URL(origin).hostname === host;
+    const originUrl = new URL(origin);
+    if (process.env.NODE_ENV !== "production") {
+      if (originUrl.hostname === "localhost" || originUrl.hostname === "127.0.0.1" || originUrl.hostname === "::1") return true;
+    }
+    const trustedHosts = (process.env.TRUSTED_HOSTS || process.env.TASKFLOW_TRUSTED_HOSTS || "")
+      .split(",")
+      .map(h => h.trim().toLowerCase())
+      .filter(Boolean);
+    if (trustedHosts.length > 0) {
+      return trustedHosts.includes(originUrl.hostname.toLowerCase());
+    }
+    const configuredHost = (process.env.APP_URL || process.env.PUBLIC_URL || process.env.TASKFLOW_URL)
+      ? new URL(process.env.APP_URL || process.env.PUBLIC_URL || process.env.TASKFLOW_URL).hostname
+      : null;
+    if (configuredHost && originUrl.hostname.toLowerCase() === configuredHost.toLowerCase()) {
+      return true;
+    }
+    return false;
   } catch {
     return false;
   }

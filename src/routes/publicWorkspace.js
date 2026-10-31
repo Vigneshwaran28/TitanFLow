@@ -5,10 +5,13 @@ import { getDb } from "../db/connection.js";
 import { workspaceMaintenance } from "../services/maintenance.js";
 import { customCssProblem, resolveSettings } from "../services/moduleSettings.js";
 import { effectiveFeatures } from "../services/tenants.js";
+import { publicRateLimiter } from "../middleware/rateLimit.js";
 import { HttpError } from "../utils/http.js";
 
 const router = Router();
 const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,58}[a-z0-9])?$/;
+
+router.use(publicRateLimiter);
 
 router.get("/:slug", async (req, res) => {
   const slug = String(req.params.slug ?? "").toLowerCase();

@@ -1644,6 +1644,30 @@ const migrations = {
       }
     },
   },
+
+  "024_meeting_roles_and_note_delete": {
+    async up(knex) {
+      if (await knex.schema.hasTable("meetings")) {
+        const hasRoleIds = await knex.schema.hasColumn("meetings", "role_ids");
+        if (!hasRoleIds) {
+          await knex.schema.alterTable("meetings", table => {
+            table.text("role_ids").nullable();
+          });
+        }
+      }
+    },
+
+    async down(knex) {
+      if (await knex.schema.hasTable("meetings")) {
+        const hasRoleIds = await knex.schema.hasColumn("meetings", "role_ids");
+        if (hasRoleIds) {
+          await knex.schema.alterTable("meetings", table => {
+            table.dropColumn("role_ids");
+          });
+        }
+      }
+    },
+  },
 };
 
 /** In-code migration source: no migration files or ESM loader quirks. */

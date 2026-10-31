@@ -47,10 +47,53 @@ const updateSchema = z.object({
   pinned: z.boolean().optional(),
   version: z.number({ error: "Send the version you edited." }).int().positive(),
 });
-const access = z.enum(["view", "edit"], { error: "Choose view or edit." });
+const access = z
+  .union([
+    z.enum(["view", "edit", "delete", "read", "write"]),
+    z.object({
+      read: z.boolean().optional(),
+      write: z.boolean().optional(),
+      delete: z.boolean().optional(),
+    }),
+  ])
+  .transform(val => {
+    if (typeof val === "object" && val !== null) {
+      if (val.delete) return "delete";
+      if (val.write) return "edit";
+      return "view";
+    }
+    if (val === "read") return "view";
+    if (val === "write") return "edit";
+    return val;
+  });
+
+const shareItemSchema = z
+  .object({
+    userId: z.number().int().positive(),
+    access: access.optional(),
+    permissions: z
+      .object({
+        read: z.boolean().optional(),
+        write: z.boolean().optional(),
+        delete: z.boolean().optional(),
+      })
+      .optional(),
+  })
+  .transform(val => {
+    let acc = val.access ?? "view";
+    if (val.permissions) {
+      if (val.permissions.delete) acc = "delete";
+      else if (val.permissions.write) acc = "edit";
+      else acc = "view";
+    }
+    return { userId: val.userId, access: acc };
+  });
+
 const sharingSchema = z.object({
-  shareAll: z.enum(["none", "view", "edit"], { error: "Choose off, view, or edit." }),
-  users: z.array(z.object({ userId: z.number().int().positive(), access }), { error: "Send a list of people." }).max(200, "Share with at most 200 people."),
+  shareAll: z
+    .enum(["none", "view", "edit", "delete", "read", "write"])
+    .transform(val => (val === "read" ? "view" : val === "write" ? "edit" : val)),
+  users: z.array(shareItemSchema, { error: "Send a list of people." }).max(200, "Share with at most 200 people."),
 });
 const transferSchema = z.object({ userId: z.number({ error: "Choose the new owner." }).int().positive() });
 const listSchema = z.object({
@@ -121,16 +164,20 @@ const canManage = req => can(req, "notes.manage");
 const displayTitle = row => row.title?.trim() || (row.body ?? "").trim().split("\n")[0].slice(0, 60) || "Untitled note";
 
 // ---- Access ----
-/** "owner" | "manage" | "edit" | "view" | null for one note row (joined with the viewer's own share as my_access). */
+/** "owner" | "manage" | "delete" | "edit" | "view" | null for one note row (joined with the viewer's own share as my_access). */
 function accessOf(row, req) {
   if (row.owner_id === req.user.id) return "owner";
   if (canManage(req)) return "manage";
   if (row.archived_at) return null; // archived notes leave everyone else's board
-  const levels = [row.my_access, row.share_all].filter(level => level === "view" || level === "edit");
+  const levels = [row.my_access, row.share_all].filter(
+    level => level === "view" || level === "edit" || level === "delete"
+  );
+  if (levels.includes("delete")) return "delete";
   if (levels.includes("edit")) return "edit";
   return levels.length ? "view" : null;
 }
-const canEditAccess = level => level === "owner" || level === "manage" || level === "edit";
+const canEditAccess = level => level === "owner" || level === "manage" || level === "edit" || level === "delete";
+const canDeleteAccess = level => level === "owner" || level === "manage" || level === "delete";
 const canControl = level => level === "owner" || level === "manage";
 
 function baseQuery(db, req) {
@@ -168,6 +215,10 @@ async function sharesFor(db, noteIds) {
 
 function toNote(row, req, shares = []) {
   const level = accessOf(row, req);
+  const canRead = Boolean(level);
+  const canWrite = canEditAccess(level);
+  const canDelete = canDeleteAccess(level);
+
   return {
     id: row.id,
     title: row.title ?? "",
@@ -178,6 +229,14 @@ function toNote(row, req, shares = []) {
     pinned: Boolean(row.pinned),
     owner: { id: row.owner_id, name: row.owner_name },
     access: level,
+    canRead,
+    canWrite,
+    canDelete,
+    permissions: {
+      read: canRead,
+      write: canWrite,
+      delete: canDelete,
+    },
     shareAll: row.share_all,
     // Who it's shared with is the owner's (and managers') business; everyone else sees only how many.
     shares: canControl(level) ? shares : null,
@@ -383,9 +442,15 @@ router.put("/:id/sharing", async (req, res) => {
     if (wanted.size) await trx("note_shares").insert([...wanted].map(([userId, accessLevel]) => ({ note_id: id, user_id: userId, access: accessLevel, created_at: now })));
     // Sharing isn't a content edit: the version stays, so nobody's open editor gets a false conflict.
     await trx("notes").where({ id }).update({ share_all: input.shareAll, updated_at: now });
-    for (const level of ["view", "edit"]) {
+    for (const level of ["view", "edit", "delete"]) {
       const people = added.filter(userId => wanted.get(userId) === level);
-      await notifyUsers(trx, people, { title: `${row.owner_name} shared a note with you: ${displayTitle(row)}`, body: level === "edit" ? "You can view and edit it in Notes." : "You can view it in Notes.", actorId: req.user.id });
+      const bodyText =
+        level === "delete"
+          ? "You have full access (view, edit, delete) in Notes."
+          : level === "edit"
+          ? "You can view and edit it in Notes."
+          : "You can view it in Notes.";
+      await notifyUsers(trx, people, { title: `${row.owner_name} shared a note with you: ${displayTitle(row)}`, body: bodyText, actorId: req.user.id });
     }
   });
   await recordTenantAudit(db, req, "note.share", displayTitle(row), { noteId: id, shareAll: input.shareAll, people: wanted.size, added: added.length, removed: dropped.length });
@@ -402,7 +467,9 @@ async function setArchived(req, res, archived) {
   const id = parseId(req.params.id);
   const db = getDb();
   const { row, level } = await loadNote(db, req, id);
-  requireControl(level);
+  if (!canDeleteAccess(level)) {
+    throw new HttpError(403, "Only the owner, manager, or users with delete permission can archive this note.", { code: "FORBIDDEN" });
+  }
   if (Boolean(row.archived_at) !== archived) {
     const before = await audienceOf(db, req, id);
     await db("notes").where({ id }).update({ archived_at: archived ? nowIso() : null, updated_at: nowIso() });
@@ -420,7 +487,9 @@ router.delete("/:id", async (req, res) => {
   const id = parseId(req.params.id);
   const db = getDb();
   const { row, level } = await loadNote(db, req, id);
-  requireControl(level);
+  if (!canDeleteAccess(level)) {
+    throw new HttpError(403, "You do not have permission to delete this note.", { code: "FORBIDDEN" });
+  }
   const audience = await audienceOf(db, req, id);
   await db.transaction(async trx => {
     await trx("note_shares").where("note_id", id).delete();

@@ -64,7 +64,13 @@ export function workspaceSessions(cookies) {
     .map(([name, token]) => ({ slug: name.slice(WORKSPACE_COOKIE_PREFIX.length), token }));
 }
 
-export const verifySession = token => jwt.verify(token, secret());
+export const verifySession = token => {
+  const payload = jwt.verify(token, secret());
+  if (payload && payload.aud === "taskflow-admin") {
+    throw new Error("Invalid token audience for user session");
+  }
+  return payload;
+};
 
 /**
  * Tracks an active session in user_sessions and enforces the tenant's maxActiveSessions limit.

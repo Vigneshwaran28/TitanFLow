@@ -569,7 +569,7 @@ router.post("/shipments/:id/events", async (req, res) => {
   const staff = can(req, "logistics.edit") || can(req, "logistics.dispatch");
   if (!staff && !(can(req, "logistics.deliver") && current.driver_id === req.user.id)) throw forbidden("You can only add updates to shipments assigned to you.");
   await db("shipment_events").insert({ shipment_id: id, status: current.status, location: input.location || null, note: input.note, actor_id: req.user.id, occurred_at: eventTime(input.occurredAt) });
-  await db("shipments").where({ id }).update({ updated_at: nowIso() });
+  await db("shipments").where({ id, tenant_id: req.user.tenant_id }).update({ updated_at: nowIso() });
   publishShipment(req, id, current.status, current.tracking_code);
   res.status(201).json(await loadDetail(db, req, id));
 });
@@ -579,7 +579,7 @@ router.delete("/shipments/:id", requirePermission("logistics.dispatch"), async (
   const db = getDb();
   const current = await findShipment(db, req, id);
   if (!["pending", "cancelled"].includes(current.status)) throw new HttpError(409, "Only pending or cancelled shipments can be deleted.", { code: "LOCKED" });
-  await db("shipments").where({ id }).delete();
+  await db("shipments").where({ id, tenant_id: req.user.tenant_id }).delete();
   await recordTenantAudit(db, req, "shipment.delete", current.number, { recipient: current.recipient_name });
   publishShipment(req, id, "deleted", current.tracking_code);
   res.status(204).end();
@@ -587,8 +587,11 @@ router.delete("/shipments/:id", requirePermission("logistics.dispatch"), async (
 
 // ---- Export ----
 const csvCell = value => {
-  let text = value == null ? "" : String(value);
-  if (/^[=+\-@\t\r]/.test(text) && typeof value === "string") text = `'${text}`; // keep spreadsheets from running it as a formula
+  if (value === null || value === undefined) return "";
+  let text = String(value);
+  if (/^[=+\-@\t\r]/.test(text) && !/^-?\d+(\.\d+)?$/.test(text)) {
+    text = `'${text}`; // keep spreadsheets from running it as a formula
+  }
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 };
 
@@ -716,11 +719,11 @@ router.delete("/carriers/:id", requirePermission("logistics.fleet.manage"), asyn
   const row = await findCarrier(db, tenantId, id);
   if (Number(row.total_shipments) > 0) {
     // Shipments keep their history: retire the carrier instead.
-    await db("carriers").where({ id }).update({ is_active: false, updated_at: nowIso() });
+    await db("carriers").where({ id, tenant_id: tenantId }).update({ is_active: false, updated_at: nowIso() });
     await recordTenantAudit(db, req, "carrier.deactivate", row.name);
     return res.json({ deleted: false, carrier: toCarrier(await findCarrier(db, tenantId, id)) });
   }
-  await db("carriers").where({ id }).delete();
+  await db("carriers").where({ id, tenant_id: tenantId }).delete();
   await recordTenantAudit(db, req, "carrier.delete", row.name);
   res.json({ deleted: true, carrier: null });
 });
@@ -827,11 +830,11 @@ router.delete("/vehicles/:id", requirePermission("logistics.fleet.manage"), asyn
   if (Number(row.active_shipments) > 0) throw new HttpError(409, "This vehicle still has shipments on it. Reassign them first.", { code: "IN_USE" });
   if (await db("shipments").where({ tenant_id: tenantId, vehicle_id: id }).first("id")) {
     // Past shipments keep their history: retire the vehicle instead.
-    await db("vehicles").where({ id }).update({ status: "retired", driver_id: null, updated_at: nowIso() });
+    await db("vehicles").where({ id, tenant_id: tenantId }).update({ status: "retired", driver_id: null, updated_at: nowIso() });
     await recordTenantAudit(db, req, "vehicle.retire", row.registration);
     return res.json({ deleted: false, vehicle: toVehicle(await findVehicle(db, tenantId, id)) });
   }
-  await db("vehicles").where({ id }).delete();
+  await db("vehicles").where({ id, tenant_id: tenantId }).delete();
   await recordTenantAudit(db, req, "vehicle.delete", row.registration);
   res.json({ deleted: true, vehicle: null });
 });
