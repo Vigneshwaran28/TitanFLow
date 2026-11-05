@@ -5,7 +5,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import knexFactory from "knex";
-import { SERVER_ROOT } from "../config/store.js";
+import { getSanitizedDatabaseUrl, SERVER_ROOT } from "../config/store.js";
 import { currentDatabase } from "./context.js";
 import { familyOf } from "./dialects.js";
 import { migrationSource } from "./migrations.js";
@@ -26,6 +26,82 @@ export function sqlitePath(filename) {
   const file = path.resolve(SERVER_ROOT, filename);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   return file;
+}
+
+/**
+ * Safely parses a PostgreSQL connection string into discrete parameters without delegating to
+ * pg-connection-string (which throws TypeError: Invalid URL in Node's WHATWG URL parser on unencoded
+ * special characters like '#', '?', '/', or '@' in passwords).
+ * Also cleans enclosing quotes, whitespace, and 'psql' prefixes, and validates placeholders.
+ */
+export function parsePostgresConnectionString(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  let str = raw.trim();
+  // Strip enclosing quotes (e.g. from .env file copies)
+  if ((str.startsWith('"') && str.endsWith('"')) || (str.startsWith("'") && str.endsWith("'"))) {
+    str = str.slice(1, -1).trim();
+  }
+  // Strip 'psql' prefix if pasted from a CLI snippet
+  str = str.replace(/^psql\s+['"]?/, "").replace(/['"]$/, "").trim();
+
+  if (!str) return null;
+
+  // Detect unreplaced template placeholders
+  if (/<[^>]+>|\[(?:PASSWORD|YOUR-PASSWORD|HOST|PORT|DB|DATABASE)\]/i.test(str)) {
+    throw Object.assign(
+      new Error(
+        "DATABASE_URL contains unreplaced placeholder text (e.g. <password> or [YOUR-PASSWORD]). Please configure it with your actual database credentials."
+      ),
+      { code: "INVALID_DATABASE_URL" }
+    );
+  }
+
+  // Regex to match standard or complex Postgres URI:
+  // [protocol://][user[:password]@]host[:port][/database][?query]
+  const pattern = /^(?:(?<protocol>postgres(?:ql)?):\/\/)?(?:(?<user>[^:@\s]+)(?::(?<password>.*))?@)?(?<host>\[[a-fA-F0-9:]+\]|[^:\/\s?#]+)(?::(?<port>\d+))?(?:\/(?<database>[^?#\s]*))?(?:\?(?<query>.*))?$/;
+  const match = str.match(pattern);
+
+  if (!match || !match.groups || !match.groups.host) {
+    throw Object.assign(
+      new Error(
+        "DATABASE_URL is not a valid PostgreSQL connection string. Expected format: postgresql://user:password@host:port/database"
+      ),
+      { code: "INVALID_DATABASE_URL" }
+    );
+  }
+
+  const { user, password, host, port, database, query } = match.groups;
+  const params = new URLSearchParams(query || "");
+
+  const safeDecode = (val) => {
+    if (!val) return val;
+    try {
+      return decodeURIComponent(val);
+    } catch {
+      return val;
+    }
+  };
+
+  const cleanHost = host.replace(/^\[(.*)\]$/, "$1");
+  const cleanPort = port ? Number(port) : 5432;
+  const cleanDb = database ? safeDecode(database) : undefined;
+  const cleanUser = user ? safeDecode(user) : undefined;
+  const cleanPassword = password !== undefined ? safeDecode(password) : undefined;
+
+  const sslmode = params.get("sslmode");
+  const isSslDisabled = sslmode === "disable";
+
+  return {
+    host: cleanHost,
+    port: cleanPort,
+    database: cleanDb,
+    user: cleanUser,
+    password: cleanPassword,
+    sslmode,
+    isSslDisabled,
+    options: params.get("options") || undefined,
+    application_name: params.get("application_name") || undefined,
+  };
 }
 
 /**
@@ -73,18 +149,26 @@ export function buildKnexConfig(config, { databaseOverride, pool } = {}) {
     };
   }
 
-  const connectionString = config.connectionString || (config.client === "postgres" ? process.env.DATABASE_URL : null);
-  if (connectionString) {
-    const isSslDisabled = connectionString.includes("sslmode=disable");
-    return {
-      client: "pg",
-      connection: {
-        connectionString,
-        ssl: isSslDisabled ? false : { rejectUnauthorized: defaultSslReject },
-        connectionTimeoutMillis: 10000,
-      },
-      pool: pool ?? { min: 0, max: 10 },
-    };
+  const rawConnString = config.connectionString || (config.client === "postgres" ? getSanitizedDatabaseUrl() : null);
+  if (rawConnString) {
+    const parsed = parsePostgresConnectionString(rawConnString);
+    if (parsed) {
+      return {
+        client: "pg",
+        connection: {
+          host: parsed.host,
+          port: parsed.port,
+          database: databaseOverride === null ? undefined : (databaseOverride ?? parsed.database),
+          user: parsed.user,
+          password: parsed.password,
+          ssl: parsed.isSslDisabled ? false : { rejectUnauthorized: defaultSslReject },
+          connectionTimeoutMillis: 10000,
+          ...(parsed.options ? { options: parsed.options } : {}),
+          ...(parsed.application_name ? { application_name: parsed.application_name } : {}),
+        },
+        pool: pool ?? { min: 0, max: 10 },
+      };
+    }
   }
 
   return {
@@ -92,7 +176,7 @@ export function buildKnexConfig(config, { databaseOverride, pool } = {}) {
     connection: {
       host: config.host,
       port: Number(config.port),
-      database: databaseOverride ?? config.database,
+      database: databaseOverride === null ? undefined : (databaseOverride ?? config.database),
       user: config.user,
       password: config.password,
       ssl: config.ssl ? { rejectUnauthorized: defaultSslReject } : false,

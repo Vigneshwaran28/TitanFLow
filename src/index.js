@@ -15,12 +15,20 @@ async function main() {
   if (edition) console.log(`[edition] standalone: ${edition.name} (/${edition.slug}), modules fixed: ${edition.features.join(", ")}`);
   const config = readConfig();
   if (config) {
-    await initDb(config.database);
-    await syncAllTenantDatabases(); // dedicated tenant databases: new tables and columns, tenant mirrors
-    startReminderScheduler();
-    startCelebrationScheduler();
-    startBroadcastScheduler(); // scheduled provider broadcasts, subscription notices
-    console.log(`[db] connected (${config.database.client})`);
+    try {
+      await initDb(config.database);
+      await syncAllTenantDatabases(); // dedicated tenant databases: new tables and columns, tenant mirrors
+      startReminderScheduler();
+      startCelebrationScheduler();
+      startBroadcastScheduler(); // scheduled provider broadcasts, subscription notices
+      console.log(`[db] connected (${config.database.client})`);
+    } catch (dbError) {
+      console.error(`[db] ERROR: Failed to connect to database: ${dbError.message}`);
+      if (process.env.DATABASE_URL) {
+        console.error("[db] HINT: DATABASE_URL is configured in your environment. Please verify that host, port, credentials, and SSL settings are correct in your hosting dashboard (e.g. Render).");
+      }
+      throw dbError;
+    }
   } else {
     console.log("[setup] not configured yet: open the app to run the setup wizard");
   }

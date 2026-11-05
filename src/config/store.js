@@ -50,14 +50,29 @@ function getJwtSecret() {
  * @property {string} configuredAt
  */
 
+/**
+ * Extracts and normalizes DATABASE_URL from process.env, removing outer quotes and whitespace.
+ * Returns null if missing or empty.
+ */
+export function getSanitizedDatabaseUrl() {
+  const raw = process.env.DATABASE_URL?.trim();
+  if (!raw || raw === "undefined" || raw === "null") return null;
+  let str = raw;
+  if ((str.startsWith('"') && str.endsWith('"')) || (str.startsWith("'") && str.endsWith("'"))) {
+    str = str.slice(1, -1).trim();
+  }
+  return str || null;
+}
+
 /** @returns {AppConfig | null} */
 export function readConfig() {
+  const dbUrl = getSanitizedDatabaseUrl();
   if (!fs.existsSync(CONFIG_PATH)) {
-    if (process.env.DATABASE_URL) {
+    if (dbUrl) {
       return {
         database: {
           client: "postgres",
-          connectionString: process.env.DATABASE_URL,
+          connectionString: dbUrl,
           ssl: true,
         },
         jwtSecret: getJwtSecret(),
@@ -67,10 +82,10 @@ export function readConfig() {
     return null;
   }
   const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-  if (process.env.DATABASE_URL) {
+  if (dbUrl) {
     config.database = {
       client: "postgres",
-      connectionString: process.env.DATABASE_URL,
+      connectionString: dbUrl,
       ssl: true,
     };
   }
