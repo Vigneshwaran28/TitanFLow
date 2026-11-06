@@ -245,10 +245,7 @@ router.post("/code-login", async (req, res) => {
     if (userRow.is_code_login_enabled === false) {
       throw new HttpError(403, "Login with access code is disabled for this account.", { code: "USER_CODE_DISABLED" });
     }
-    if (userRow.password_hash) {
-      if (!input.password) {
-        throw new HttpError(400, "Password is required to sign in with this access code.", { code: "PASSWORD_REQUIRED" });
-      }
+    if (input.password && userRow.password_hash) {
       const isPasswordValid = await bcrypt.compare(input.password, userRow.password_hash);
       if (!isPasswordValid) {
         recordFailure(ipKey);
