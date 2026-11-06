@@ -38,6 +38,7 @@ router.get("/:slug", async (req, res) => {
       message: branding.loginMessage,
       highlights: branding.loginHighlights,
       supportContact: branding.supportContact,
+      loginImageUrl: branding.loginImageUrl || branding.backgroundImage || null,
       // Sanitized on save; only sent while the workspace has custom CSS switched on (never the app block); re-checked in case of older data.
       ...(branding.customCssEnabled && branding.customCss?.login && !customCssProblem(branding.customCss.login) ? { customCss: branding.customCss.login } : {}),
     },

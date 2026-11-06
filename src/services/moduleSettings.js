@@ -7,7 +7,7 @@ export const TICKET_CATEGORIES = ["it_support", "access", "hardware", "software"
 export const LEAVE_TYPES = ["annual", "sick", "casual", "unpaid", "other"];
 export const WEEKDAYS = [0, 1, 2, 3, 4, 5, 6]; // Sunday = 0
 export const APPOINTMENT_TYPES = ["consultation", "follow_up", "procedure", "teleconsult", "vaccination", "lab_test", "checkup"];
-export const LOGIN_TEMPLATES = ["split", "centered", "banner", "minimal", "corporate"];
+export const LOGIN_TEMPLATES = ["split", "centered", "banner", "minimal", "corporate", "interactive", "shapes", "scenic", "glass"];
 export const LOGIN_BACKGROUNDS = ["indigo", "ocean", "sunset", "forest", "midnight", "rose", "plain"];
 export const PAYMENT_METHODS =["cash", "card", "bank_transfer", "upi", "cheque", "other"];
 
@@ -88,6 +88,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     loginMessage: "",
     loginHighlights: [], // up to 5 short lines (empty = the workspace's modules)
     supportContact: "", // shown under the form: who to ask for an account or a password reset
+    loginImageUrl: "", // custom scenic or background image URL for showcase/glass templates
     // Logo: one of LOGO_ICONS on the brand colour, or an image link (used in the sidebar, sign-in page, and browser tab).
     logoIcon: "check",
     logoUrl: "",
@@ -355,6 +356,7 @@ export const settingsSchema = z
         logoIcon: z.string().trim().min(1).max(80),
         logoUrl: imageUrlSchema,
         backgroundImage: imageUrlSchema,
+        loginImageUrl: imageUrlSchema,
         backgroundDim: z.number().int().min(0).max(90),
         backgroundTextColor: z.string().max(50).optional(),
         lockAccent: z.boolean(),
